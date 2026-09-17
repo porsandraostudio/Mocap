@@ -1,0 +1,9 @@
+# Media
+*.mp4
+*.mov
+
+# Python
+__pycache__/
+
+# Binaries
+*.exe

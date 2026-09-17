@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mocap</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@500;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css?v=67" />
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <h1>Mocap</h1>
+    </header>
+
+    <section class="source-bar">
+      <h2>Source</h2>
+      <div class="row source-actions">
+        <label class="btn">
+          Upload
+          <input type="file" id="fileInput" accept="video/*" hidden />
+        </label>
+        <button type="button" class="btn ghost" id="camBtn">Camera</button>
+      </div>
+      <p class="hint" id="sourceHint">Upload a video or record with the camera.</p>
+      <div class="top-meta" id="clipMeta">No clip loaded</div>
+    </section>
+
+    <main class="stage">
+      <section class="bundle preview-track">
+        <div class="bundle-head">
+          <h2>Preview</h2>
+        </div>
+        <div class="video-frame" id="videoFrame">
+          <video id="video" playsinline muted></video>
+          <canvas id="overlay"></canvas>
+          <div class="empty" id="emptyState">
+            Upload a clip or use the camera, then drag a box around the thing you want to follow.
+          </div>
+        </div>
+        <div class="transport">
+          <button type="button" class="icon-btn" id="playBtn" title="Play / pause">Play</button>
+          <input type="range" id="seek" min="0" max="0" step="0.001" value="0" />
+          <span class="time" id="timeLabel">0 / 0</span>
+        </div>
+        <div class="track-tools">
+          <div class="row">
+            <label class="field grow">
+              Tracker
+              <select id="tracker">
+                <option value="lk">Optical flow</option>
+                <option value="ncc">Template match</option>
+                <option value="mil">MIL (OpenCV)</option>
+              </select>
+            </label>
+            <label class="field grow">
+              Axis
+              <select id="axis">
+                <option value="y">Y</option>
+                <option value="x">X</option>
+                <option value="xy">X + Y</option>
+              </select>
+            </label>
+            <label class="field grow">
+              FPS
+              <input type="number" id="fps" value="30" min="1" max="240" step="0.01" />
+            </label>
+          </div>
+          <p class="hint" id="trackerHint">Optical flow follows corners inside the box. Fast; best default for textured motion.</p>
+          <div class="row">
+            <button type="button" class="btn" id="drawBtn">Draw box</button>
+            <button type="button" class="btn primary" id="trackBtn">Track</button>
+          </div>
+          <div class="progress hidden" id="progressWrap">
+            <div class="bar" id="progressBar"></div>
+            <span id="progressText">Tracking…</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="bundle curve-export">
+        <div class="curve-head">
+          <h2>Export</h2>
+          <span class="hint" id="fitHint">Track or load JSON. Distance is meters. Black dots are knots.</span>
+        </div>
+        <canvas id="plot"></canvas>
+        <div class="export-tools">
+          <label class="check"><input type="checkbox" id="invert" checked /> Invert axis (image Y is down)</label>
+          <div class="row">
+            <label class="field grow">
+              Curve min (m)
+              <input type="number" id="outMin" value="0" step="0.01" />
+            </label>
+            <label class="field grow">
+              Curve max (m)
+              <input type="number" id="outMax" value="0.08" step="0.01" />
+            </label>
+          </div>
+          <label class="field">
+            Smoothing <span id="smoothLabel">1e-5</span>
+            <input type="range" id="smoothing" min="-8" max="-2" step="0.1" value="-5" />
+          </label>
+          <div class="row">
+            <button type="button" class="btn" id="csvBtn" disabled>CSV</button>
+            <button type="button" class="btn primary" id="jsonBtn" disabled>JSON</button>
+            <label class="btn ghost">
+              Load JSON
+              <input type="file" id="jsonInput" accept="application/json,.json" hidden />
+            </label>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js?v=67"></script>
+</body>
+</html>
