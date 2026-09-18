@@ -21,7 +21,7 @@ def smoothing_spline(
 ) -> PPoly:
     """SciPy power-basis spline; `s = smoothing * n` matches being.spline.
 
-    mocap_beta.exe default smoothing is 0 (interpolating spline).
+    Default smoothing is 0 (interpolating spline).
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -30,10 +30,10 @@ def smoothing_spline(
 
 
 def fit_spline(times: Sequence[float], values: Sequence[float], smoothing: float = 0.0) -> BPoly:
-    """Sort, drop duplicate times, then fit a cubic BPoly like mocap_beta.exe.
+    """Sort, drop duplicate times, then fit a cubic BPoly for being Curve export.
 
-    The exe calls being.spline.smoothing_spline → BPoly.from_power_basis and
-    keeps the repeated end knots that PPoly.from_spline inserts.
+    Pipeline: smoothing_spline → BPoly.from_power_basis, keeping the repeated
+    end knots that PPoly.from_spline inserts.
     """
     times = np.asarray(times, dtype=float)
     values = np.asarray(values, dtype=float)

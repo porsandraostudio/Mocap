@@ -1,4 +1,4 @@
-"""Frame-by-frame CSRT box tracker, matching PATHOS mocap 1.2.2-beta."""
+"""Frame-by-frame CSRT box tracker for video mocap."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ import cv2
 # Optional callback: progress(frames_done, frames_total, last_sample_preview | None)
 ProgressCallback = Optional[Callable[..., None]]
 
-# mocap_beta.exe Camera.grab_frame: imutils.resize when a side exceeds 640.
-EXE_MAX_SIDE = 640
+# Cap the long side so tracking stays fast on high-res clips.
+TRACK_MAX_SIDE = 640
 
 
-def exe_frame_size(width: int, height: int, max_side: int = EXE_MAX_SIDE) -> tuple[int, int]:
-    """Return the size the desktop app would track at (imutils.resize, INTER_AREA)."""
+def track_frame_size(width: int, height: int, max_side: int = TRACK_MAX_SIDE) -> tuple[int, int]:
+    """Return the downscaled size used for tracking (height then width, INTER_AREA)."""
     width, height = int(width), int(height)
     if height > max_side:
         ratio = max_side / float(height)
@@ -25,8 +25,8 @@ def exe_frame_size(width: int, height: int, max_side: int = EXE_MAX_SIDE) -> tup
     return max(1, width), max(1, height)
 
 
-def resize_like_exe(frame, max_side: int = EXE_MAX_SIDE):
-    """Same sequential height-then-width shrink as mocap_beta.exe / imutils.resize."""
+def resize_for_tracking(frame, max_side: int = TRACK_MAX_SIDE):
+    """Shrink a frame so neither side exceeds max_side (height first, then width)."""
     height, width = frame.shape[:2]
     if height > max_side:
         ratio = max_side / float(height)
@@ -47,7 +47,7 @@ def resize_like_exe(frame, max_side: int = EXE_MAX_SIDE):
 
 
 def scale_bbox(bbox, src_w: int, src_h: int, dst_w: int, dst_h: int) -> tuple[int, int, int, int]:
-    """Map a box between native video pixels and the exe tracking frame."""
+    """Map a box between native video pixels and the tracking frame."""
     sx = dst_w / src_w if src_w else 1.0
     sy = dst_h / src_h if src_h else 1.0
     x, y, box_w, box_h = bbox
@@ -60,7 +60,7 @@ def scale_bbox(bbox, src_w: int, src_h: int, dst_w: int, dst_h: int) -> tuple[in
 
 
 def _clamp_bbox(bbox, frame_shape) -> tuple[int, int, int, int]:
-    """Clamp [x, y, w, h] to the frame using int() truncation like the exe."""
+    """Clamp [x, y, w, h] to the frame using int() truncation."""
     frame_h, frame_w = frame_shape[:2]
     x, y, box_w, box_h = (int(v) for v in bbox)
     x = max(0, min(x, max(0, frame_w - 1)))
@@ -71,7 +71,7 @@ def _clamp_bbox(bbox, frame_shape) -> tuple[int, int, int, int]:
 
 
 def _box_center(box) -> tuple[int, int]:
-    """Integer center: x + width//2, y + height//2 (BBox.center in the exe)."""
+    """Integer box center: x + width//2, y + height//2."""
     x, y, box_w, box_h = (int(v) for v in box)
     return x + box_w // 2, y + box_h // 2
 
@@ -99,7 +99,7 @@ def _create_csrt():
 
 
 class CsrtTracker:
-    """OpenCV TrackerCSRT — same tracker as mocap_beta.exe (TrackerCSRT_create)."""
+    """Thin wrapper around OpenCV TrackerCSRT."""
 
     def __init__(self):
         self.opencv_tracker = _create_csrt()
@@ -114,7 +114,6 @@ class CsrtTracker:
         ok, box = self.opencv_tracker.update(frame)
         if not ok or box is None:
             return False, (0, 0, 0, 0)
-        # exe: BBox(*map(int, tracker.update(frame)[1]))
         return True, tuple(int(v) for v in box)
 
 
@@ -186,7 +185,7 @@ def read_video_info(path: str) -> dict:
     except cv2.error:
         pass
     capture.release()
-    track_w, track_h = exe_frame_size(width, height)
+    track_w, track_h = track_frame_size(width, height)
     return {
         "fps": fps,
         "width": width,
@@ -202,21 +201,21 @@ def track_video(
     path: str,
     bbox: tuple[float, float, float, float],
     start_frame: int = 0,
-    stamp_fps: float | None = None,
+    timestamp_fps: float | None = None,
     progress: ProgressCallback = None,
 ) -> dict:
-    """Track `bbox` from `start_frame` like mocap_beta.exe (CSRT, 640 resize, stop on loss).
+    """Track `bbox` from `start_frame` with CSRT (640-capped frames, stop on loss).
 
     `bbox` is in native video pixels (the HTML player). It is scaled into the
-    same 640-capped frame the desktop app tracks. Sample times are
-    `i / stamp_fps` starting at 0, matching the exe videofile timestamps.
+    downscaled tracking frame. Sample times are `i / timestamp_fps` starting at 0
+    on the selection frame.
     """
     capture = cv2.VideoCapture(path)
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
 
     native_fps = _safe_fps(capture)
-    fps = float(stamp_fps) if stamp_fps and float(stamp_fps) >= 1 else native_fps
+    fps = float(timestamp_fps) if timestamp_fps and float(timestamp_fps) >= 1 else native_fps
     native_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     native_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -230,7 +229,7 @@ def track_video(
     if native_width < 8 or native_height < 8:
         native_height, native_width = int(frame.shape[0]), int(frame.shape[1])
 
-    frame = resize_like_exe(frame)
+    frame = resize_for_tracking(frame)
     height, width = frame.shape[:2]
     track_bbox = scale_bbox(bbox, native_width, native_height, width, height)
     track_bbox = _clamp_bbox(track_bbox, frame.shape)
@@ -270,7 +269,7 @@ def track_video(
         }
 
     lost_target = False
-    # exe: first trajectory sample is (0,) + bbox.center on the selection frame.
+    # First trajectory sample is t=0 at the selection-frame box center.
     record_sample(track_bbox, 0.0)
     frames_done = 1
     frames_total = max(frame_count - start_frame, 0)
@@ -282,7 +281,7 @@ def track_video(
         ok, frame = capture.read()
         if not ok:
             break
-        frame = resize_like_exe(frame)
+        frame = resize_for_tracking(frame)
         frames_done += 1
         hit, box = tracker.update(frame)
         if not hit or box[2] <= 0 or box[3] <= 0:

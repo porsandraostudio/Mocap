@@ -3,13 +3,16 @@
  * Talks to the local FastAPI backend on the same origin.
  *
  * Naming notes for new developers:
- * - byId(id)              look up a DOM element by id
- * - state.bbox            selection box [x, y, w, h] in video pixels
- * - state.track           raw tracking result (times + centers + boxes)
- * - state.heightMapped    series after Curve min/max stretch (meters)
- * - state.fitResult       last fit/load payload used for CSV/JSON download
+ * - byId(id)                 look up a DOM element by id
+ * - state.bbox               selection box [x, y, w, h] in video pixels
+ * - state.track              raw tracking result (times + centers + boxes)
+ * - state.scaledSeries       series after Curve min/max stretch (meters)
+ * - state.fitResult          last fit/load payload used for CSV/JSON download
  * - state.loadedCurveSource  original loaded Curve before height remap
  * - state.hasLoadedCurve     true while UI is working from a loaded JSON Curve
+ * - state.mediaTime          frame-accurate playhead from requestVideoFrameCallback
+ * - timestampFps()           FPS used to build sample timestamps
+ * - rebuildTrackTimestamps() rewrite track.times as i / timestampFps
  */
 "use strict";
 
@@ -28,7 +31,7 @@ const state = {
   drawStartPoint: null,
   bbox: null, // [x, y, w, h] in video pixels
   track: null,
-  heightMapped: null,
+  scaledSeries: null,
   fitResult: null,
   hasLoadedCurve: false,
   loadedCurveSource: null,
@@ -42,7 +45,7 @@ const state = {
   recordingClockTimer: null,
   recordingStartedAt: 0,
   isTracking: false,
-  presentedTime: null,
+  mediaTime: null,
   frameClockHandle: null,
   trackSeekPending: false,
 };
@@ -174,7 +177,8 @@ function nativeFps() {
   return Number(state.videoMeta?.fps) || 30;
 }
 
-function stampFps() {
+/** FPS from the UI field, used when building track sample timestamps. */
+function timestampFps() {
   const value = Number(byId("fps")?.value);
   if (Number.isFinite(value) && value >= 1 && value <= 240) return value;
   return nativeFps();
@@ -186,10 +190,10 @@ function formatFps(value) {
   return n.toFixed(2).replace(/\.?0+$/, "") || "30";
 }
 
-/** Exe videofile stamps: t = i / fps starting at 0 on the selection frame. */
-function restampTrackTimes() {
+/** Rebuild track sample times as t = i / timestampFps from the selection frame. */
+function rebuildTrackTimestamps() {
   if (!state.track?.times?.length) return;
-  const fps = stampFps();
+  const fps = timestampFps();
   const times = state.track.times;
   for (let i = 0; i < times.length; i += 1) times[i] = i / fps;
   state.track.fps = fps;
@@ -244,7 +248,7 @@ function trackFrameSize() {
   };
 }
 
-/** Map exe tracking-frame pixels onto the native video the player shows. */
+/** Map tracking-frame pixels onto the native video the player shows. */
 function trackToNative(x, y) {
   const { tw, th, vw, vh } = trackFrameSize();
   return { x: x * vw / tw, y: y * vh / th };
@@ -272,7 +276,7 @@ function nativeToTrackBox(box) {
 }
 
 function displayedTime() {
-  if (Number.isFinite(state.presentedTime)) return state.presentedTime;
+  if (Number.isFinite(state.mediaTime)) return state.mediaTime;
   return Number(video.currentTime) || 0;
 }
 
@@ -281,10 +285,10 @@ function startFrameClock() {
     video.cancelVideoFrameCallback(state.frameClockHandle);
     state.frameClockHandle = null;
   }
-  state.presentedTime = null;
+  state.mediaTime = null;
   if (typeof video.requestVideoFrameCallback !== "function") return;
   const tick = (_now, meta) => {
-    state.presentedTime = meta.mediaTime;
+    state.mediaTime = meta.mediaTime;
     state.frameClockHandle = video.requestVideoFrameCallback(tick);
     if (!state.isLiveCamera) drawOverlay();
   };
@@ -398,7 +402,7 @@ function drawDot(x, y, color = "#e07070", r = 4) {
   ctx.fill();
 }
 
-/** EXE-style trail: gray mask outside the box, red path + crosshair. */
+/** Tracking trail: gray mask outside the box, red path + crosshair. */
 function drawTrajectoryPreview(layout) {
   if (!state.track || state.track.times.length < 2) return;
   const axis = byId("axis").value;
@@ -526,7 +530,7 @@ function trackedSeriesInMeters() {
   };
   const series = {};
   const axis = byId("axis").value;
-  // exe inverts image Y only, then stretches min→0 / max→amplitude.
+  // Invert flips image Y only, then stretch min→0 / max→amplitude.
   if (axis === "x" || axis === "xy") series.x = project(state.track.x, false);
   if (axis === "y" || axis === "xy") series.y = project(state.track.y, invert);
   return { times: state.track.times.slice(), series };
@@ -566,7 +570,7 @@ function remapLoadedCurveHeight() {
       ));
     }
   });
-  state.heightMapped = { times: state.loadedCurveSource.dense_times, series: dense };
+  state.scaledSeries = { times: state.loadedCurveSource.dense_times, series: dense };
   state.fitResult = {
     ...state.loadedCurveSource.payload,
     dense,
@@ -581,7 +585,7 @@ function remapLoadedCurveHeight() {
 function seriesReadyForFit() {
   if (state.loadedCurveSource) {
     remapLoadedCurveHeight();
-    return state.heightMapped;
+    return state.scaledSeries;
   }
   return trackedSeriesInMeters();
 }
@@ -608,7 +612,7 @@ function drawPlot() {
   plotCtx.fillText("distance (m)", 8, 14);
   plotCtx.fillText("duration (s)", cssW - 92, cssH - 10);
 
-  const data = (!state.hasLoadedCurve && trackedSeriesInMeters()) || state.heightMapped;
+  const data = (!state.hasLoadedCurve && trackedSeriesInMeters()) || state.scaledSeries;
   if (!data) {
     plotCtx.strokeStyle = "#c9d0d9";
     plotCtx.beginPath();
@@ -745,7 +749,7 @@ function attachVideo(meta) {
   state.videoId = meta.id;
   state.videoMeta = meta;
   state.track = null;
-  state.heightMapped = null;
+  state.scaledSeries = null;
   state.hasLoadedCurve = false;
   state.loadedCurveSource = null;
   state.hasResmoothedLoadedCurve = false;
@@ -765,7 +769,7 @@ function attachVideo(meta) {
   video.muted = true;
   emptyState.textContent = "Upload a clip or use the camera, then drag a box around the thing you want to follow.";
   emptyState.classList.add("hidden");
-  setClipMeta(`${meta.name}  ·  ${clipSizeLabel(meta)}  ·  ${stampFps().toFixed(2)} fps  ·  ${formatSeconds(meta.duration)}s`);
+  setClipMeta(`${meta.name}  ·  ${clipSizeLabel(meta)}  ·  ${timestampFps().toFixed(2)} fps  ·  ${formatSeconds(meta.duration)}s`);
   byId("sourceHint").textContent = "";
   byId("seek").max = meta.duration || 0;
   byId("seek").disabled = false;
@@ -792,7 +796,7 @@ function refreshClipMeta() {
   const known = Number(state.videoMeta.duration) || 0;
   // Only grow duration. A partial WebM buffer must not replace the recording length.
   const duration = media > known ? media : (known || media);
-  const fps = stampFps();
+  const fps = timestampFps();
   state.videoMeta.duration = duration;
   setClipMeta(`${state.videoMeta.name}  ·  ${clipSizeLabel(state.videoMeta)}  ·  ${fps.toFixed(2)} fps  ·  ${formatSeconds(duration)}s`);
   if (!state.isLiveCamera) {
@@ -823,7 +827,7 @@ async function showLivePreview(stream) {
   state.isLiveCamera = true;
   state.track = null;
   state.bbox = null;
-  state.heightMapped = null;
+  state.scaledSeries = null;
   state.hasLoadedCurve = false;
   state.loadedCurveSource = null;
   state.hasResmoothedLoadedCurve = false;
@@ -916,7 +920,7 @@ function applyTrackJob(job) {
   }
   if (!job.result) return;
   state.track = job.result;
-  restampTrackTimes();
+  rebuildTrackTimestamps();
   clearFitResult();
   byId("progressText").textContent = `Tracked ${job.result.times.length} frames, lost ${job.result.lost}`;
   const seeking = seekToTrackSample(state.track.start_frame, state.track.times.length);
@@ -970,7 +974,7 @@ async function pollTrackJob(jobId) {
   }
 }
 
-/** Exe slider 0–500 is divided by 1e7 before being.spline (100 → 1e-5). */
+/** UI smoothing 0–500 maps to being.spline s via / 1e7 (100 → 1e-5). */
 function currentSmoothing() {
   const slider = Number(byId("smoothing").value);
   if (!Number.isFinite(slider) || slider <= 0) return 0;
@@ -1014,7 +1018,7 @@ async function runSplineFit() {
       byId("fitHint").textContent = errorMessage(data) || `Fit failed (${res.status})`;
       return;
     }
-    state.heightMapped = mapped;
+    state.scaledSeries = mapped;
     state.fitResult = data;
     const durationSec = Number(data.duration);
     const durationLabel = Number.isFinite(durationSec)
@@ -1089,7 +1093,7 @@ byId("drawBtn").onclick = () => {
   clearTrackPollTimer();
   state.isTracking = false;
   state.track = null;
-  state.heightMapped = null;
+  state.scaledSeries = null;
   clearFitResult();
   video.pause();
   syncPlayButton();
@@ -1208,7 +1212,7 @@ byId("trackBtn").onclick = async () => {
       video_id: state.videoId,
       bbox: state.bbox,
       start_time: startTime,
-      fps: stampFps(),
+      fps: timestampFps(),
     }),
   });
   const data = await res.json();
@@ -1227,7 +1231,7 @@ byId("smoothing").oninput = () => {
     scheduleSplineFit();
     return;
   }
-  state.heightMapped = null;
+  state.scaledSeries = null;
   clearFitResult();
   scheduleSplineFit();
 };
@@ -1241,7 +1245,7 @@ byId("smoothing").oninput = () => {
       else byId("fitHint").textContent = `Height ${byId("outMin").value}–${byId("outMax").value} m`;
       return;
     }
-    state.heightMapped = null;
+    state.scaledSeries = null;
     clearFitResult();
     drawOverlay();
     drawPlot();
@@ -1255,8 +1259,8 @@ byId("fps").addEventListener("input", () => {
     drawPlot();
     return;
   }
-  restampTrackTimes();
-  state.heightMapped = null;
+  rebuildTrackTimestamps();
+  state.scaledSeries = null;
   clearFitResult();
   drawOverlay();
   drawPlot();

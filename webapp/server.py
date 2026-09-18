@@ -214,7 +214,7 @@ def _run_track(job_id: str, req: TrackRequest):
         return
 
     native_fps = float(video["fps"] or 30.0)
-    stamp_fps = float(req.fps) if req.fps is not None else native_fps
+    timestamp_fps = float(req.fps) if req.fps is not None else native_fps
     start_frame = int(round(max(0.0, req.start_time) * native_fps))
     nframes = int(video.get("nframes") or 0)
     if nframes > 0:
@@ -240,7 +240,7 @@ def _run_track(job_id: str, req: TrackRequest):
                 path,
                 tuple(req.bbox),
                 start_frame=start_frame,
-                stamp_fps=stamp_fps,
+                timestamp_fps=timestamp_fps,
                 progress=progress,
             )
         _publish_job(job_id, status="done", progress=1, result=result, preview=None)
