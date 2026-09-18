@@ -32,7 +32,6 @@ from .spline_fit import (
     fit_spline,
     format_csv,
     spline_axis_names,
-    unique_knot_times,
 )
 from .tracking import read_video_info, track_video
 
@@ -328,7 +327,7 @@ def fit(req: FitRequest):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    payload = export_payload(splines, list(req.series), req.times)
+    payload = export_payload(splines, list(req.series))
     # CSV keeps the height-mapped track samples (not re-sampled spline values).
     payload["csv"] = format_csv(req.times, req.series)
     return payload
@@ -350,7 +349,6 @@ async def load_curve(file: UploadFile = File(...)):
     payload = export_payload(
         splines,
         spline_axis_names(len(splines)),
-        unique_knot_times(splines[0]),
         curve_json=text,
     )
     payload["name"] = Path(file.filename or "curve.json").name

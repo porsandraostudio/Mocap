@@ -120,13 +120,10 @@ def spline_axis_names(count: int) -> list[str]:
 def export_payload(
     splines: list[BPoly],
     names: Sequence[str],
-    sample_times: Sequence[float],
     curve_json: str | None = None,
 ) -> dict:
     """Build the plot + download payload shared by /api/fit and /api/load-curve."""
     names = list(names)
-    times = np.asarray(sample_times, dtype=float)
-    sampled = {name: sample_spline(spline, times) for name, spline in zip(names, splines)}
     t0, t1 = float(splines[0].x[0]), float(splines[0].x[-1])
     dense_times = np.linspace(t0, t1, 500).tolist()
     dense = {name: sample_spline(spline, dense_times) for name, spline in zip(names, splines)}
@@ -135,7 +132,7 @@ def export_payload(
     duration = float(max(0.0, t1 - t0))
     return {
         "curve": curve_json if curve_json is not None else curve_to_json(splines),
-        "csv": format_csv(times.tolist(), sampled),
+        "csv": format_csv(knot_times, knot_values),
         "dense_times": dense_times,
         "dense": dense,
         "knot_times": knot_times,

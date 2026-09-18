@@ -1,6 +1,7 @@
 /**
  * Mocap UI — upload/record, draw a box, track, fit being Curve, export CSV/JSON.
- * Talks to the local FastAPI backend on the same origin.
+ * Uses the local FastAPI backend when /api/health is up (OpenCV CSRT).
+ * Otherwise tracking + spline fitting run in the browser (GitHub Pages).
  *
  * Naming notes for new developers:
  * - byId(id)                 look up a DOM element by id
@@ -25,7 +26,9 @@ const emptyState = document.getElementById("emptyState");
 const videoFrame = document.getElementById("videoFrame");
 
 const state = {
+  backend: false,
   videoId: null,
+  objectUrl: null,
   videoMeta: null,
   isDrawingBox: false,
   drawStartPoint: null,
@@ -117,6 +120,30 @@ function download(name, text, type) {
   a.download = name;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+function revokeObjectUrl() {
+  if (state.objectUrl) {
+    URL.revokeObjectURL(state.objectUrl);
+    state.objectUrl = null;
+  }
+}
+
+async function detectBackend() {
+  try {
+    const res = await fetch("api/health", { cache: "no-store" });
+    const data = res.ok ? await res.json().catch(() => null) : null;
+    state.backend = !!(data && data.ok);
+  } catch {
+    state.backend = false;
+  }
+  return state.backend;
+}
+
+let backendReady = null;
+function ensureBackend() {
+  if (!backendReady) backendReady = detectBackend();
+  return backendReady;
 }
 
 function errorMessage(data) {
@@ -728,10 +755,15 @@ function setClipMeta(text) {
 }
 
 async function uploadFile(file, extras = {}) {
+  await ensureBackend();
+  if (!state.backend) {
+    attachLocalFile(file, extras);
+    return;
+  }
   const body = new FormData();
   body.append("file", file);
   byId("sourceHint").textContent = "Uploading…";
-  const res = await fetch("/api/upload", { method: "POST", body });
+  const res = await fetch("api/upload", { method: "POST", body });
   if (!res.ok) {
     byId("sourceHint").textContent = errorMessage(await res.json().catch(() => ({}))) || `Upload failed (${res.status})`;
     return;
@@ -741,7 +773,44 @@ async function uploadFile(file, extras = {}) {
   attachVideo(meta);
 }
 
-function attachVideo(meta) {
+function attachLocalFile(file, extras = {}) {
+  byId("sourceHint").textContent = "Loading clip…";
+  revokeObjectUrl();
+  const url = URL.createObjectURL(file);
+  state.objectUrl = url;
+  let done = false;
+  const onReady = () => {
+    if (done) return;
+    done = true;
+    video.removeEventListener("loadedmetadata", onReady);
+    const vw = video.videoWidth || 0;
+    const vh = video.videoHeight || 0;
+    if (vw < 8 || vh < 8) {
+      byId("sourceHint").textContent = "Video has no usable frames. Record a bit longer and try again.";
+      return;
+    }
+    const size = MocapTrack.trackFrameSize(vw, vh);
+    const duration = extras.duration || mediaDuration();
+    attachVideo({
+      id: "local",
+      name: file.name || "clip",
+      width: vw,
+      height: vh,
+      track_width: size.width,
+      track_height: size.height,
+      fps: extras.fps || 30,
+      duration,
+      nframes: duration > 0 ? Math.round(duration * (extras.fps || 30)) : 0,
+    }, url);
+  };
+  video.addEventListener("loadedmetadata", onReady);
+  video.removeAttribute("src");
+  video.srcObject = null;
+  video.src = url;
+  if (video.readyState >= 1) onReady();
+}
+
+function attachVideo(meta, srcUrl) {
   stopCamera();
   clearLivePreview();
   clearTrackPollTimer();
@@ -763,9 +832,18 @@ function attachVideo(meta) {
   }
   byId("invert").checked = true;
   if (byId("fps")) byId("fps").value = formatFps(meta.fps || 30);
-  video.removeAttribute("src");
-  video.srcObject = null;
-  video.src = `/api/video/${meta.id}/file`;
+  if (srcUrl) {
+    if (video.src !== srcUrl) {
+      video.removeAttribute("src");
+      video.srcObject = null;
+      video.src = srcUrl;
+    }
+  } else {
+    revokeObjectUrl();
+    video.removeAttribute("src");
+    video.srcObject = null;
+    video.src = `api/video/${meta.id}/file`;
+  }
   video.muted = true;
   emptyState.textContent = "Upload a clip or use the camera, then drag a box around the thing you want to follow.";
   emptyState.classList.add("hidden");
@@ -786,7 +864,7 @@ function setBoxDrawing(on) {
   videoFrame.classList.toggle("drawing", on);
   byId("drawBtn").textContent = on ? "Drawing…" : "Draw box";
   if (on) {
-    byId("sourceHint").textContent = "Keep the box tight on the marker only. Extra background lets CSRT lock onto edges instead.";
+    byId("sourceHint").textContent = "Keep the box tight on the marker only. Extra background lets the tracker lock onto edges instead.";
   }
 }
 
@@ -869,12 +947,7 @@ function startRecClock() {
 // ---------------------------------------------------------------------------
 
 function applyTrackPreview(preview) {
-  if (!preview || !state.track) return;
-  if (Array.isArray(preview.times) && preview.times.length) {
-    state.track = preview;
-    return;
-  }
-  if (preview.t == null || !preview.bbox) return;
+  if (!preview || !state.track || preview.t == null || !preview.bbox) return;
   const times = state.track.times;
   const last = times.length - 1;
   if (last >= 0 && times[last] === preview.t) {
@@ -936,7 +1009,7 @@ function watchTrackJob(jobId) {
     pollTrackJob(jobId);
     return;
   }
-  const es = new EventSource(`/api/jobs/${jobId}/events`);
+  const es = new EventSource(`api/jobs/${jobId}/events`);
   state.trackSource = es;
   es.onmessage = (ev) => {
     let job;
@@ -961,7 +1034,7 @@ function watchTrackJob(jobId) {
 
 async function pollTrackJob(jobId) {
   try {
-    const res = await fetch(`/api/jobs/${jobId}`);
+    const res = await fetch(`api/jobs/${jobId}`);
     const job = await res.json();
     applyTrackJob(job);
     if (job.status === "running" && state.isTracking) {
@@ -1004,19 +1077,27 @@ async function runSplineFit() {
   }
   byId("fitHint").textContent = "Fitting spline…";
   try {
-    const res = await fetch("/api/fit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        times: mapped.times,
-        series: mapped.series,
-        smoothing: currentSmoothing(),
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      byId("fitHint").textContent = errorMessage(data) || `Fit failed (${res.status})`;
-      return;
+    let data;
+    if (state.backend) {
+      const res = await fetch("api/fit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          times: mapped.times,
+          series: mapped.series,
+          smoothing: currentSmoothing(),
+        }),
+      });
+      data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        byId("fitHint").textContent = errorMessage(data) || `Fit failed (${res.status})`;
+        return;
+      }
+    } else {
+      const names = Object.keys(mapped.series);
+      const splines = names.map((name) => MocapSpline.fitSpline(mapped.times, mapped.series[name], currentSmoothing()));
+      data = MocapSpline.exportPayload(splines, names);
+      data.csv = formatCsv(mapped.times, mapped.series);
     }
     state.scaledSeries = mapped;
     state.fitResult = data;
@@ -1205,7 +1286,31 @@ byId("trackBtn").onclick = async () => {
   byId("progressWrap").classList.remove("hidden");
   byId("progressBar").style.width = "0%";
   byId("progressText").textContent = "Starting…";
-  const res = await fetch("/api/track", {
+  await ensureBackend();
+  if (!state.backend) {
+    try {
+      const result = await MocapTrack.trackHtmlVideo(video, {
+        bbox: state.bbox,
+        startTime,
+        nativeFps: fileFps,
+        timestampFps: timestampFps(),
+        shouldStop: () => !state.isTracking,
+        onProgress: (preview, done, total) => {
+          const pct = Math.round((total ? done / total : 0) * 100);
+          byId("progressBar").style.width = `${pct}%`;
+          byId("progressText").textContent = `Tracking ${pct}%`;
+          applyTrackPreview(preview);
+          drawOverlay();
+        },
+      });
+      if (!state.isTracking) return;
+      applyTrackJob({ status: "done", progress: 1, result });
+    } catch (err) {
+      applyTrackJob({ status: "error", progress: 0, error: err.message || "Tracking failed" });
+    }
+    return;
+  }
+  const res = await fetch("api/track", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1283,43 +1388,57 @@ byId("fileInput").onchange = (event) => {
   if (file) uploadFile(file);
 };
 
+function applyLoadedCurve(data, fileName) {
+  state.hasLoadedCurve = true;
+  state.hasResmoothedLoadedCurve = false;
+  state.exportFileName = data.name || fileName;
+  const series = data.dense || {};
+  const primary = series[data.primary] || series.y || Object.values(series)[0] || [];
+  const lo = primary.length ? Math.min(...primary) : 0;
+  const hi = primary.length ? Math.max(...primary) : 0.10;
+  byId("outMin").value = formatMetersInput(lo);
+  byId("outMax").value = formatMetersInput(hi);
+  byId("invert").checked = false;
+  state.loadedCurveSource = {
+    curve: data.curve,
+    dense: data.dense,
+    dense_times: data.dense_times,
+    knot_times: data.knot_times,
+    knot_values: data.knot_values,
+    payload: data,
+  };
+  remapLoadedCurveHeight();
+  byId("csvBtn").disabled = false;
+  byId("jsonBtn").disabled = false;
+  byId("fitHint").textContent = `Loaded ${data.knots} knots. Smoothing and Curve min/max still apply.`;
+  drawPlot();
+}
+
 byId("jsonInput").onchange = async (event) => {
   const file = event.target.files?.[0];
   event.target.value = "";
   if (!file) return;
-  const body = new FormData();
-  body.append("file", file);
   byId("fitHint").textContent = "Loading curve…";
   try {
-    const res = await fetch("/api/load-curve", { method: "POST", body });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      byId("fitHint").textContent = errorMessage(data) || `Could not load JSON (${res.status})`;
-      return;
+    await ensureBackend();
+    let data;
+    if (state.backend) {
+      const body = new FormData();
+      body.append("file", file);
+      const res = await fetch("api/load-curve", { method: "POST", body });
+      data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        byId("fitHint").textContent = errorMessage(data) || `Could not load JSON (${res.status})`;
+        return;
+      }
+    } else {
+      const text = await file.text();
+      const splines = MocapSpline.curveFromJson(text);
+      const names = MocapSpline.splineAxisNames(splines.length);
+      data = MocapSpline.exportPayload(splines, names, text);
+      data.name = file.name;
     }
-    state.hasLoadedCurve = true;
-    state.hasResmoothedLoadedCurve = false;
-    state.exportFileName = data.name || file.name;
-    const series = data.dense || {};
-    const primary = series[data.primary] || series.y || Object.values(series)[0] || [];
-    const lo = primary.length ? Math.min(...primary) : 0;
-    const hi = primary.length ? Math.max(...primary) : 0.10;
-    byId("outMin").value = formatMetersInput(lo);
-    byId("outMax").value = formatMetersInput(hi);
-    byId("invert").checked = false;
-    state.loadedCurveSource = {
-      curve: data.curve,
-      dense: data.dense,
-      dense_times: data.dense_times,
-      knot_times: data.knot_times,
-      knot_values: data.knot_values,
-      payload: data,
-    };
-    remapLoadedCurveHeight();
-    byId("csvBtn").disabled = false;
-    byId("jsonBtn").disabled = false;
-    byId("fitHint").textContent = `Loaded ${data.knots} knots. Smoothing and Curve min/max still apply.`;
-    drawPlot();
+    applyLoadedCurve(data, file.name);
   } catch (err) {
     byId("fitHint").textContent = err.message || "Could not load JSON";
   }
@@ -1387,3 +1506,4 @@ window.addEventListener("keydown", (event) => {
 
 resizeOverlay();
 drawPlot();
+ensureBackend();
