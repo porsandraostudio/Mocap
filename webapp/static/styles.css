@@ -87,7 +87,6 @@ h2 {
 }
 
 .source-bar h2 { margin-right: 4px; }
-.source-actions { margin: 0; }
 .source-bar #sourceHint { flex: 1; min-width: 180px; margin: 0; }
 .source-bar #sourceHint:empty { display: none; }
 .source-bar #clipMeta { margin-left: auto; text-align: right; }

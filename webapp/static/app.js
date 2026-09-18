@@ -10,7 +10,6 @@
  * - state.fitResult       last fit/load payload used for CSV/JSON download
  * - state.loadedCurveSource  original loaded Curve before height remap
  * - state.hasLoadedCurve     true while UI is working from a loaded JSON Curve
- * - Tracker values lk/ncc/mil are API ids (Optical flow / Template / MIL)
  */
 "use strict";
 
@@ -36,18 +35,16 @@ const state = {
   hasResmoothedLoadedCurve: false,
   exportFileName: null,
   trackPollTimer: null,
+  trackSource: null,
   cameraStream: null,
   recorder: null,
   isLiveCamera: false,
   recordingClockTimer: null,
   recordingStartedAt: 0,
   isTracking: false,
-};
-
-const TRACKER_HINTS = {
-  lk: "Optical flow follows corners inside the box. Fast; best default for textured motion.",
-  ncc: "Template match slides the original box image around each frame to find the best look-alike. Use when the marker stays the same shape and brightness.",
-  mil: "MIL is OpenCV’s Multiple Instance Learning tracker. It can survive some appearance change and clutter, but it is slower and can drift.",
+  presentedTime: null,
+  frameClockHandle: null,
+  trackSeekPending: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,6 +127,10 @@ function errorMessage(data) {
 }
 
 function clearTrackPollTimer() {
+  if (state.trackSource) {
+    state.trackSource.close();
+    state.trackSource = null;
+  }
   if (state.trackPollTimer) {
     clearTimeout(state.trackPollTimer);
     state.trackPollTimer = null;
@@ -185,37 +186,12 @@ function formatFps(value) {
   return n.toFixed(2).replace(/\.?0+$/, "") || "30";
 }
 
-function snapLabeledDuration(duration) {
-  if (!(duration > 0)) return duration;
-  const labeled = Math.round(duration);
-  return labeled > duration ? labeled : duration;
-}
-
-/** Match Python `_times_cover_clip` so FPS changes restamp the curve. */
+/** Exe videofile stamps: t = i / fps starting at 0 on the selection frame. */
 function restampTrackTimes() {
   if (!state.track?.times?.length) return;
   const fps = stampFps();
   const times = state.track.times;
-  const n = times.length;
-  const startFrame = Number(state.track.start_frame) || 0;
-  const frameCount = Number(state.track.nframes) || 0;
-  const counted = n / fps;
-  const fileDur = frameCount > 1 ? frameCount / fps : counted;
-  const duration = snapLabeledDuration(Math.max(fileDur, clipDuration() || 0, counted));
-  const atEnd = frameCount <= 0 || startFrame + n >= frameCount;
-  const tStart = startFrame <= 0
-    ? 0
-    : (frameCount > 1 ? (startFrame / (frameCount - 1)) * duration : startFrame / fps);
-  const tEnd = atEnd
-    ? duration
-    : (frameCount > 1 ? ((startFrame + n - 1) / (frameCount - 1)) * duration : tStart + n / fps);
-  if (n === 1) {
-    times[0] = atEnd ? tEnd : tStart;
-  } else {
-    const span = Math.max(0, tEnd - tStart);
-    for (let i = 0; i < n; i += 1) times[i] = tStart + (i / (n - 1)) * span;
-    times[n - 1] = tEnd;
-  }
+  for (let i = 0; i < times.length; i += 1) times[i] = i / fps;
   state.track.fps = fps;
 }
 
@@ -234,8 +210,6 @@ function videoLayout() {
     scale,
     ox: (rect.width - dw) / 2,
     oy: (rect.height - dh) / 2,
-    dw,
-    dh,
     vw,
     vh,
   };
@@ -261,19 +235,91 @@ function resizeOverlay() {
   drawOverlay();
 }
 
+function trackFrameSize() {
+  return {
+    tw: Number(state.track?.width) || video.videoWidth || 1,
+    th: Number(state.track?.height) || video.videoHeight || 1,
+    vw: video.videoWidth || Number(state.videoMeta?.width) || 1,
+    vh: video.videoHeight || Number(state.videoMeta?.height) || 1,
+  };
+}
+
+/** Map exe tracking-frame pixels onto the native video the player shows. */
+function trackToNative(x, y) {
+  const { tw, th, vw, vh } = trackFrameSize();
+  return { x: x * vw / tw, y: y * vh / th };
+}
+
+function boxToNative(box) {
+  if (!box) return box;
+  if (!state.track) return box;
+  const a = trackToNative(box[0], box[1]);
+  const b = trackToNative(box[0] + box[2], box[1] + box[3]);
+  return [a.x, a.y, b.x - a.x, b.y - a.y];
+}
+
+function nativeToTrackBox(box) {
+  const tw = Number(state.videoMeta?.track_width) || video.videoWidth || 1;
+  const th = Number(state.videoMeta?.track_height) || video.videoHeight || 1;
+  const vw = video.videoWidth || Number(state.videoMeta?.width) || 1;
+  const vh = video.videoHeight || Number(state.videoMeta?.height) || 1;
+  return [
+    Math.floor(box[0] * tw / vw),
+    Math.floor(box[1] * th / vh),
+    Math.max(1, Math.floor(box[2] * tw / vw)),
+    Math.max(1, Math.floor(box[3] * th / vh)),
+  ];
+}
+
+function displayedTime() {
+  if (Number.isFinite(state.presentedTime)) return state.presentedTime;
+  return Number(video.currentTime) || 0;
+}
+
+function startFrameClock() {
+  if (state.frameClockHandle != null && typeof video.cancelVideoFrameCallback === "function") {
+    video.cancelVideoFrameCallback(state.frameClockHandle);
+    state.frameClockHandle = null;
+  }
+  state.presentedTime = null;
+  if (typeof video.requestVideoFrameCallback !== "function") return;
+  const tick = (_now, meta) => {
+    state.presentedTime = meta.mediaTime;
+    state.frameClockHandle = video.requestVideoFrameCallback(tick);
+    if (!state.isLiveCamera) drawOverlay();
+  };
+  state.frameClockHandle = video.requestVideoFrameCallback(tick);
+}
+
 function currentIndex() {
   if (!state.track || !state.track.times.length) return -1;
   const n = state.track.times.length;
   const start = Number(state.track.start_frame) || 0;
-  const nframes = Number(state.track.nframes) || 0;
-  const duration = clipDuration();
-  if (nframes > 1 && duration > 0) {
-    const frame = Math.round(((Number(video.currentTime) || 0) / duration) * (nframes - 1));
-    return Math.max(0, Math.min(n - 1, frame - start));
-  }
-  if (!(duration > 0) || n === 1) return n - 1;
-  const u = Math.max(0, Math.min(1, (Number(video.currentTime) || 0) / duration));
-  return Math.max(0, Math.min(n - 1, Math.round(u * (n - 1))));
+  const fps = Number(state.track.native_fps) || nativeFps();
+  const frame = Math.round(displayedTime() * fps);
+  return Math.max(0, Math.min(n - 1, frame - start));
+}
+
+function trackSampleVideoTime(startFrame, sampleCount) {
+  const fps = Number(state.track?.native_fps) || nativeFps();
+  if (!(fps > 0)) return 0;
+  const frame = (Number(startFrame) || 0) + Math.max(1, sampleCount) - 1;
+  return frame / fps;
+}
+
+/** Advance the player to a track sample, but never stack seeks (one in flight). */
+function seekToTrackSample(startFrame, sampleCount) {
+  const t = trackSampleVideoTime(startFrame, sampleCount);
+  if (state.trackSeekPending || video.seeking) return false;
+  if (Math.abs((Number(video.currentTime) || 0) - t) < 0.04) return false;
+  state.trackSeekPending = true;
+  const finish = () => {
+    video.removeEventListener("seeked", finish);
+    state.trackSeekPending = false;
+  };
+  video.addEventListener("seeked", finish);
+  video.currentTime = t;
+  return true;
 }
 
 function trackPlayheadTime() {
@@ -284,24 +330,27 @@ function trackPlayheadTime() {
 }
 
 function currentBox() {
+  if (state.isDrawingBox) return state.bbox;
   const idx = currentIndex();
   if (idx < 0) return state.bbox;
   return state.track.bboxes[idx];
 }
 
 function toScreen(vx, vy, layout) {
+  const native = state.track ? trackToNative(vx, vy) : { x: vx, y: vy };
   return {
-    x: layout.ox + vx * layout.scale,
-    y: layout.oy + vy * layout.scale,
+    x: layout.ox + native.x * layout.scale,
+    y: layout.oy + native.y * layout.scale,
   };
 }
 
 function drawBoxAt(box, layout, color = "#e02020") {
   if (!box) return;
-  const x = layout.ox + box[0] * layout.scale;
-  const y = layout.oy + box[1] * layout.scale;
-  const bw = box[2] * layout.scale;
-  const bh = box[3] * layout.scale;
+  const native = (!state.isDrawingBox && (state.isTracking || state.track)) ? boxToNative(box) : box;
+  const x = layout.ox + native[0] * layout.scale;
+  const y = layout.oy + native[1] * layout.scale;
+  const bw = native[2] * layout.scale;
+  const bh = native[3] * layout.scale;
   ctx.strokeStyle = color;
   ctx.lineWidth = 3;
   ctx.strokeRect(x, y, bw, bh);
@@ -322,9 +371,10 @@ function drawMask(layout, box) {
   ctx.fillStyle = "rgba(128, 128, 128, 0.84)";
   ctx.fillRect(0, 0, w, h);
   if (!box) return;
-  const x = layout.ox + box[0] * layout.scale;
-  const y = layout.oy + box[1] * layout.scale;
-  ctx.clearRect(x, y, box[2] * layout.scale, box[3] * layout.scale);
+  const native = (!state.isDrawingBox && (state.isTracking || state.track)) ? boxToNative(box) : box;
+  const x = layout.ox + native[0] * layout.scale;
+  const y = layout.oy + native[1] * layout.scale;
+  ctx.clearRect(x, y, native[2] * layout.scale, native[3] * layout.scale);
 }
 
 function drawPolylineScreen(points, color = "#e07070") {
@@ -357,9 +407,8 @@ function drawTrajectoryPreview(layout) {
   const ys = state.track.y;
   const speed = 5;
   const trailColor = "#e02020";
-  const box = currentBox();
-  const cx = box ? box[0] + box[2] / 2 : xs[idx];
-  const cy = box ? box[1] + box[3] / 2 : ys[idx];
+  const cx = xs[idx];
+  const cy = ys[idx];
 
   if (axis === "xy") {
     const pts = [];
@@ -372,7 +421,7 @@ function drawTrajectoryPreview(layout) {
 
   if (axis === "y") {
     const guideTop = toScreen(cx, 0, layout);
-    const guideBot = toScreen(cx, state.track.height, layout);
+    const guideBot = toScreen(cx, Number(state.track.height) || 0, layout);
     ctx.beginPath();
     ctx.strokeStyle = trailColor;
     ctx.lineWidth = 2;
@@ -390,7 +439,7 @@ function drawTrajectoryPreview(layout) {
   }
 
   const guideLeft = toScreen(0, cy, layout);
-  const guideRight = toScreen(state.track.width, cy, layout);
+  const guideRight = toScreen(Number(state.track.width) || 0, cy, layout);
   ctx.beginPath();
   ctx.strokeStyle = trailColor;
   ctx.lineWidth = 2;
@@ -413,6 +462,10 @@ function drawOverlay() {
   ctx.clearRect(0, 0, w, h);
   const layout = videoLayout();
   const box = currentBox();
+  if (state.isDrawingBox) {
+    drawBoxAt(box, layout, "#4d8dff");
+    return;
+  }
   if (state.isTracking || state.track) {
     drawMask(layout, box);
     drawTrajectoryPreview(layout);
@@ -466,15 +519,16 @@ function formatCsv(times, columns) {
 function trackedSeriesInMeters() {
   if (!state.track) return null;
   const { outMin, outMax, invert } = curveHeightRange();
-  const project = (values) => {
+  const project = (values, flip) => {
     const lo = Math.min(...values);
     const hi = Math.max(...values);
-    return stretchValuesToRange(values, lo, hi, outMin, outMax, invert);
+    return stretchValuesToRange(values, lo, hi, outMin, outMax, flip);
   };
   const series = {};
   const axis = byId("axis").value;
-  if (axis === "x" || axis === "xy") series.x = project(state.track.x);
-  if (axis === "y" || axis === "xy") series.y = project(state.track.y);
+  // exe inverts image Y only, then stretches min→0 / max→amplitude.
+  if (axis === "x" || axis === "xy") series.x = project(state.track.x, false);
+  if (axis === "y" || axis === "xy") series.y = project(state.track.y, invert);
   return { times: state.track.times.slice(), series };
 }
 
@@ -656,6 +710,15 @@ function drawPlot() {
 // Source: upload / camera
 // ---------------------------------------------------------------------------
 
+function clipSizeLabel(meta) {
+  const tw = Number(meta.track_width);
+  const th = Number(meta.track_height);
+  if (tw > 0 && th > 0 && (tw !== meta.width || th !== meta.height)) {
+    return `${meta.width}×${meta.height} (track ${tw}×${th})`;
+  }
+  return `${meta.width}×${meta.height}`;
+}
+
 function setClipMeta(text) {
   byId("clipMeta").textContent = text;
 }
@@ -692,7 +755,7 @@ function attachVideo(meta) {
   clearFitResult();
   if (resetHeightFromCurve) {
     byId("outMin").value = "0";
-    byId("outMax").value = "0.08";
+    byId("outMax").value = "0.10";
   }
   byId("invert").checked = true;
   if (byId("fps")) byId("fps").value = formatFps(meta.fps || 30);
@@ -702,13 +765,14 @@ function attachVideo(meta) {
   video.muted = true;
   emptyState.textContent = "Upload a clip or use the camera, then drag a box around the thing you want to follow.";
   emptyState.classList.add("hidden");
-  setClipMeta(`${meta.name}  ·  ${meta.width}×${meta.height}  ·  ${stampFps().toFixed(2)} fps  ·  ${formatSeconds(meta.duration)}s`);
+  setClipMeta(`${meta.name}  ·  ${clipSizeLabel(meta)}  ·  ${stampFps().toFixed(2)} fps  ·  ${formatSeconds(meta.duration)}s`);
   byId("sourceHint").textContent = "";
   byId("seek").max = meta.duration || 0;
   byId("seek").disabled = false;
   byId("playBtn").disabled = false;
   syncPlayButton();
   byId("timeLabel").textContent = `0 / ${formatSeconds(meta.duration)}`;
+  startFrameClock();
   drawOverlay();
   drawPlot();
 }
@@ -717,6 +781,9 @@ function setBoxDrawing(on) {
   state.isDrawingBox = on;
   videoFrame.classList.toggle("drawing", on);
   byId("drawBtn").textContent = on ? "Drawing…" : "Draw box";
+  if (on) {
+    byId("sourceHint").textContent = "Keep the box tight on the marker only. Extra background lets CSRT lock onto edges instead.";
+  }
 }
 
 function refreshClipMeta() {
@@ -726,13 +793,8 @@ function refreshClipMeta() {
   // Only grow duration. A partial WebM buffer must not replace the recording length.
   const duration = media > known ? media : (known || media);
   const fps = stampFps();
-  const grew = duration > known;
   state.videoMeta.duration = duration;
-  setClipMeta(`${state.videoMeta.name}  ·  ${state.videoMeta.width}×${state.videoMeta.height}  ·  ${fps.toFixed(2)} fps  ·  ${formatSeconds(duration)}s`);
-  if (grew && state.track && !state.hasLoadedCurve) {
-    restampTrackTimes();
-    drawPlot();
-  }
+  setClipMeta(`${state.videoMeta.name}  ·  ${clipSizeLabel(state.videoMeta)}  ·  ${fps.toFixed(2)} fps  ·  ${formatSeconds(duration)}s`);
   if (!state.isLiveCamera) {
     syncSeekBar();
   }
@@ -802,28 +864,46 @@ function startRecClock() {
 // Tracking / fit / export
 // ---------------------------------------------------------------------------
 
-async function pollTrackJob(jobId) {
-  const res = await fetch(`/api/jobs/${jobId}`);
-  const job = await res.json();
+function applyTrackPreview(preview) {
+  if (!preview || !state.track) return;
+  if (Array.isArray(preview.times) && preview.times.length) {
+    state.track = preview;
+    return;
+  }
+  if (preview.t == null || !preview.bbox) return;
+  const times = state.track.times;
+  const last = times.length - 1;
+  if (last >= 0 && times[last] === preview.t) {
+    state.track.x[last] = preview.x;
+    state.track.y[last] = preview.y;
+    state.track.bboxes[last] = preview.bbox;
+  } else {
+    times.push(preview.t);
+    state.track.x.push(preview.x);
+    state.track.y.push(preview.y);
+    state.track.bboxes.push(preview.bbox);
+  }
+  if (preview.lost != null) state.track.lost = preview.lost;
+  if (preview.width) state.track.width = preview.width;
+  if (preview.height) state.track.height = preview.height;
+  if (preview.fps) state.track.fps = preview.fps;
+  if (preview.native_fps) state.track.native_fps = preview.native_fps;
+  if (preview.start_frame != null) state.track.start_frame = preview.start_frame;
+}
+
+function applyTrackJob(job) {
   const pct = Math.round((job.progress || 0) * 100);
   byId("progressBar").style.width = `${pct}%`;
   byId("progressText").textContent = job.status === "running"
     ? `Tracking ${pct}%`
     : job.status;
-  if (job.preview?.times?.length) {
-    state.track = job.preview;
-    const nframes = Number(job.preview.nframes) || Number(state.videoMeta?.nframes) || 0;
-    const duration = clipDuration();
-    if (nframes > 1 && duration > 0) {
-      const frame = (Number(job.preview.start_frame) || 0) + job.preview.times.length - 1;
-      const videoTime = (frame / (nframes - 1)) * duration;
-      if (Math.abs((video.currentTime || 0) - videoTime) > 0.04) video.currentTime = videoTime;
-    }
-    drawOverlay();
-    drawPlot();
-  }
   if (job.status === "running") {
-    state.trackPollTimer = setTimeout(() => pollTrackJob(jobId), 160);
+    if (job.preview) {
+      applyTrackPreview(job.preview);
+      const n = job.preview.n || state.track.times.length;
+      const seeked = seekToTrackSample(job.preview.start_frame, n);
+      if (!seeked) drawOverlay();
+    }
     return;
   }
   state.isTracking = false;
@@ -834,22 +914,72 @@ async function pollTrackJob(jobId) {
     drawOverlay();
     return;
   }
+  if (!job.result) return;
   state.track = job.result;
   restampTrackTimes();
   clearFitResult();
   byId("progressText").textContent = `Tracked ${job.result.times.length} frames, lost ${job.result.lost}`;
-  const duration = clipDuration();
-  if (duration > 0 && (Number(state.track.start_frame) || 0) === 0) {
-    video.currentTime = duration;
-  }
+  const seeking = seekToTrackSample(state.track.start_frame, state.track.times.length);
   syncSeekBar();
-  drawOverlay();
+  if (!seeking) drawOverlay();
   drawPlot();
   scheduleSplineFit();
 }
 
+function watchTrackJob(jobId) {
+  clearTrackPollTimer();
+  if (typeof EventSource === "undefined") {
+    pollTrackJob(jobId);
+    return;
+  }
+  const es = new EventSource(`/api/jobs/${jobId}/events`);
+  state.trackSource = es;
+  es.onmessage = (ev) => {
+    let job;
+    try {
+      job = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    applyTrackJob(job);
+    if (job.status === "done" || job.status === "error") {
+      es.close();
+      if (state.trackSource === es) state.trackSource = null;
+    }
+  };
+  es.onerror = () => {
+    if (state.trackSource !== es) return;
+    es.close();
+    state.trackSource = null;
+    if (state.isTracking) pollTrackJob(jobId);
+  };
+}
+
+async function pollTrackJob(jobId) {
+  try {
+    const res = await fetch(`/api/jobs/${jobId}`);
+    const job = await res.json();
+    applyTrackJob(job);
+    if (job.status === "running" && state.isTracking) {
+      state.trackPollTimer = setTimeout(() => pollTrackJob(jobId), 400);
+    }
+  } catch {
+    if (state.isTracking) {
+      state.trackPollTimer = setTimeout(() => pollTrackJob(jobId), 400);
+    }
+  }
+}
+
+/** Exe slider 0–500 is divided by 1e7 before being.spline (100 → 1e-5). */
 function currentSmoothing() {
-  return 10 ** Number(byId("smoothing").value);
+  const slider = Number(byId("smoothing").value);
+  if (!Number.isFinite(slider) || slider <= 0) return 0;
+  return slider / 1e7;
+}
+
+function formatSmoothing(value) {
+  if (!(value > 0)) return "0";
+  return value.toExponential(1).replace("+", "");
 }
 
 let splineFitTimer = null;
@@ -908,20 +1038,18 @@ async function runSplineFit() {
   }
 }
 
-function refreshTrackerHint() {
-  if (!byId("trackerHint")) return;
-  byId("trackerHint").textContent = TRACKER_HINTS[byId("tracker").value] || TRACKER_HINTS.lk;
-}
-
 // ---------------------------------------------------------------------------
 // Event wiring
 // ---------------------------------------------------------------------------
 
 overlay.addEventListener("pointerdown", (event) => {
   if (!state.isDrawingBox || !video.videoWidth) return;
+  if (typeof overlay.setPointerCapture === "function") {
+    overlay.setPointerCapture(event.pointerId);
+  }
   const p = clientToVideo(event);
   state.drawStartPoint = p;
-  state.bbox = [p.x, p.y, 1, 1];
+  state.bbox = [Math.floor(p.x), Math.floor(p.y), 1, 1];
   drawOverlay();
 });
 
@@ -930,15 +1058,27 @@ overlay.addEventListener("pointermove", (event) => {
   const p = clientToVideo(event);
   const x = Math.min(state.drawStartPoint.x, p.x);
   const y = Math.min(state.drawStartPoint.y, p.y);
-  state.bbox = [x, y, Math.abs(p.x - state.drawStartPoint.x), Math.abs(p.y - state.drawStartPoint.y)];
+  state.bbox = [
+    Math.floor(x),
+    Math.floor(y),
+    Math.max(1, Math.floor(Math.abs(p.x - state.drawStartPoint.x))),
+    Math.max(1, Math.floor(Math.abs(p.y - state.drawStartPoint.y))),
+  ];
   drawOverlay();
 });
 
-overlay.addEventListener("pointerup", () => {
+function endBoxDrawing() {
   if (!state.isDrawingBox) return;
   state.drawStartPoint = null;
   setBoxDrawing(false);
-});
+  drawOverlay();
+}
+
+overlay.addEventListener("pointerup", endBoxDrawing);
+overlay.addEventListener("pointercancel", endBoxDrawing);
+
+window.addEventListener("pointerup", endBoxDrawing);
+window.addEventListener("pointercancel", endBoxDrawing);
 
 byId("drawBtn").onclick = () => {
   if (!state.videoId) return;
@@ -946,9 +1086,16 @@ byId("drawBtn").onclick = () => {
     byId("sourceHint").textContent = "The player cannot decode this clip, so you cannot draw a box. Re-export as H.264 MP4 or WebM.";
     return;
   }
+  clearTrackPollTimer();
+  state.isTracking = false;
+  state.track = null;
+  state.heightMapped = null;
+  clearFitResult();
   video.pause();
   syncPlayButton();
   setBoxDrawing(true);
+  drawOverlay();
+  drawPlot();
 };
 
 byId("playBtn").onclick = () => {
@@ -973,8 +1120,17 @@ video.addEventListener("timeupdate", () => {
   if (state.isLiveCamera) return;
   syncSeekBar();
   syncPlayButton();
+  if (video.seeking) return;
+  if (typeof video.requestVideoFrameCallback !== "function") drawOverlay();
+  if (!state.isTracking) drawPlot();
+});
+
+video.addEventListener("seeked", () => {
+  if (state.isLiveCamera) return;
+  state.trackSeekPending = false;
+  syncSeekBar();
   drawOverlay();
-  drawPlot();
+  if (!state.isTracking) drawPlot();
 });
 
 video.addEventListener("play", () => {
@@ -1003,6 +1159,7 @@ video.addEventListener("error", () => {
 video.addEventListener("loadedmetadata", () => {
   refreshClipMeta();
   resizeOverlay();
+  startFrameClock();
 });
 video.addEventListener("durationchange", refreshClipMeta);
 video.addEventListener("progress", refreshClipMeta);
@@ -1015,17 +1172,23 @@ byId("trackBtn").onclick = async () => {
   const box = state.bbox;
   const duration = clipDuration();
   const fileFps = nativeFps();
-  let startTime = Number(video.currentTime) || 0;
+  let startTime = displayedTime();
   if (duration > 0) startTime = Math.min(startTime, Math.max(0, duration - 1 / fileFps));
+  const trackBox = nativeToTrackBox(box);
+  const tw = Number(state.videoMeta?.track_width) || video.videoWidth;
+  const th = Number(state.videoMeta?.track_height) || video.videoHeight;
   clearTrackPollTimer();
   state.isTracking = true;
+  state.trackSeekPending = false;
   state.track = {
-    times: [startTime],
-    x: [box[0] + box[2] / 2],
-    y: [box[1] + box[3] / 2],
-    bboxes: [box.slice()],
-    width: state.videoMeta?.width || video.videoWidth,
-    height: state.videoMeta?.height || video.videoHeight,
+    times: [0],
+    x: [trackBox[0] + Math.floor(trackBox[2] / 2)],
+    y: [trackBox[1] + Math.floor(trackBox[3] / 2)],
+    bboxes: [trackBox.slice()],
+    width: tw,
+    height: th,
+    native_fps: fileFps,
+    start_frame: Math.round(startTime * fileFps),
     lost: 0,
   };
   state.hasLoadedCurve = false;
@@ -1044,10 +1207,8 @@ byId("trackBtn").onclick = async () => {
     body: JSON.stringify({
       video_id: state.videoId,
       bbox: state.bbox,
-      tracker: byId("tracker").value,
       start_time: startTime,
       fps: stampFps(),
-      duration: duration || undefined,
     }),
   });
   const data = await res.json();
@@ -1056,11 +1217,11 @@ byId("trackBtn").onclick = async () => {
     byId("progressText").textContent = errorMessage(data);
     return;
   }
-  pollTrackJob(data.job_id);
+  watchTrackJob(data.job_id);
 };
 
 byId("smoothing").oninput = () => {
-  byId("smoothLabel").textContent = currentSmoothing().toExponential(0);
+  byId("smoothLabel").textContent = formatSmoothing(currentSmoothing());
   if (state.hasLoadedCurve) {
     byId("fitHint").textContent = "Smoothing loaded curve…";
     scheduleSplineFit();
@@ -1114,6 +1275,7 @@ byId("jsonBtn").onclick = () => {
 
 byId("fileInput").onchange = (event) => {
   const file = event.target.files?.[0];
+  event.target.value = "";
   if (file) uploadFile(file);
 };
 
@@ -1137,7 +1299,7 @@ byId("jsonInput").onchange = async (event) => {
     const series = data.dense || {};
     const primary = series[data.primary] || series.y || Object.values(series)[0] || [];
     const lo = primary.length ? Math.min(...primary) : 0;
-    const hi = primary.length ? Math.max(...primary) : 0.08;
+    const hi = primary.length ? Math.max(...primary) : 0.10;
     byId("outMin").value = formatMetersInput(lo);
     byId("outMax").value = formatMetersInput(hi);
     byId("invert").checked = false;
@@ -1207,8 +1369,6 @@ byId("camBtn").onclick = async () => {
   }
 };
 
-byId("tracker").addEventListener("change", refreshTrackerHint);
-
 window.addEventListener("resize", () => {
   resizeOverlay();
   drawPlot();
@@ -1223,4 +1383,3 @@ window.addEventListener("keydown", (event) => {
 
 resizeOverlay();
 drawPlot();
-refreshTrackerHint();

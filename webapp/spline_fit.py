@@ -16,34 +16,25 @@ def smoothing_spline(
     x: Sequence[float],
     y: Sequence[float],
     degree: int = 3,
-    smoothing: float = 1e-6,
+    smoothing: float = 0.0,
     extrapolate: bool = False,
 ) -> PPoly:
-    """SciPy power-basis spline; `s = smoothing * n` matches being.spline."""
+    """SciPy power-basis spline; `s = smoothing * n` matches being.spline.
+
+    mocap_beta.exe default smoothing is 0 (interpolating spline).
+    """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     tck = splrep(x, y, k=degree, s=smoothing * len(x))
     return PPoly.from_spline(tck, extrapolate)
 
 
-def remove_duplicate_knots(spline: PPoly) -> PPoly:
-    """Drop zero-width intervals left by PPoly.from_spline (being.spline.remove_duplicates).
+def fit_spline(times: Sequence[float], values: Sequence[float], smoothing: float = 0.0) -> BPoly:
+    """Sort, drop duplicate times, then fit a cubic BPoly like mocap_beta.exe.
 
-    Without this, exported Curve JSON keeps repeated end knots like
-    [0, 0, 0, 0, 1.1, …]. Some being players then only run the first real
-    segment (~1 s) instead of the full clip.
+    The exe calls being.spline.smoothing_spline → BPoly.from_power_basis and
+    keeps the repeated end knots that PPoly.from_spline inserts.
     """
-    _, unique_idx = np.unique(spline.x, return_index=True)
-    return type(spline).construct_fast(
-        spline.c[:, unique_idx[:-1]],
-        spline.x[unique_idx],
-        spline.extrapolate,
-        spline.axis,
-    )
-
-
-def fit_spline(times: Sequence[float], values: Sequence[float], smoothing: float = 1e-6) -> BPoly:
-    """Sort, drop duplicate times, then fit a cubic BPoly (being.spline.fit_spline)."""
     times = np.asarray(times, dtype=float)
     values = np.asarray(values, dtype=float)
     if len(times) < 4:
@@ -55,7 +46,6 @@ def fit_spline(times: Sequence[float], values: Sequence[float], smoothing: float
     if len(times) < 4:
         raise ValueError("Need at least 4 unique timestamps to fit a cubic spline.")
     ppoly = smoothing_spline(times, values, smoothing=smoothing, extrapolate=False)
-    ppoly = remove_duplicate_knots(ppoly)
     return BPoly.from_power_basis(ppoly)
 
 

@@ -10,6 +10,8 @@ deleted immediately afterward.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import os
 import tempfile
 import threading
@@ -20,7 +22,7 @@ from typing import Iterator
 
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -32,7 +34,7 @@ from .spline_fit import (
     spline_axis_names,
     unique_knot_times,
 )
-from .tracking import TRACKER_NAMES, read_video_info, track_video
+from .tracking import read_video_info, track_video
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -56,21 +58,44 @@ app = FastAPI(title="Mocap", description="Local video box tracker → being Curv
 VIDEO_STORE: dict[str, dict] = {}
 JOB_STORE: dict[str, dict] = {}
 JOB_LOCK = threading.Lock()
+_JOB_INTERNAL = frozenset({"wake", "seq"})
+
+
+def _new_job() -> dict:
+    return {"status": "running", "progress": 0, "seq": 0, "wake": threading.Event()}
+
+
+def _public_job(job: dict) -> dict:
+    out = {k: v for k, v in job.items() if k not in _JOB_INTERNAL}
+    if out.get("preview") is None or out.get("status") in ("done", "error"):
+        out.pop("preview", None)
+    return out
+
+
+def _publish_job(job_id: str, **fields) -> None:
+    """Merge fields into the job and wake any SSE listener."""
+    with JOB_LOCK:
+        job = JOB_STORE.setdefault(job_id, _new_job())
+        job.update(fields)
+        job["seq"] = int(job.get("seq") or 0) + 1
+        wake = job.get("wake")
+        if wake is None:
+            wake = threading.Event()
+            job["wake"] = wake
+        wake.set()
 
 
 class TrackRequest(BaseModel):
     video_id: str
     bbox: list[float] = Field(min_length=4, max_length=4)
-    tracker: str = "lk"
     start_time: float = 0.0
     fps: float | None = None
-    duration: float | None = None
 
 
 class FitRequest(BaseModel):
     times: list[float]
     series: dict[str, list[float]]
-    smoothing: float = 1e-5
+    smoothing: float = 0.0
 
 
 @contextmanager
@@ -155,7 +180,7 @@ def _range_response(data: bytes, mime: str, filename: str, request: Request) -> 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "trackers": sorted(TRACKER_NAMES)}
+    return {"ok": True, "tracker": "csrt"}
 
 
 @app.post("/api/upload")
@@ -185,18 +210,11 @@ def _run_track(job_id: str, req: TrackRequest):
     """Background worker: write progress/preview into JOB_STORE until done or error."""
     video = VIDEO_STORE.get(req.video_id)
     if not video or "data" not in video:
-        with JOB_LOCK:
-            JOB_STORE[job_id] = {"status": "error", "error": "Unknown video.", "progress": 0}
+        _publish_job(job_id, status="error", error="Unknown video.", progress=0)
         return
 
     native_fps = float(video["fps"] or 30.0)
-    stamp_fps = native_fps
-    if req.fps is not None:
-        if req.fps < 1 or req.fps > 240:
-            with JOB_LOCK:
-                JOB_STORE[job_id] = {"status": "error", "error": "FPS must be between 1 and 240.", "progress": 0}
-            return
-        stamp_fps = float(req.fps)
+    stamp_fps = float(req.fps) if req.fps is not None else native_fps
     start_frame = int(round(max(0.0, req.start_time) * native_fps))
     nframes = int(video.get("nframes") or 0)
     if nframes > 0:
@@ -205,44 +223,42 @@ def _run_track(job_id: str, req: TrackRequest):
     def progress(done, total, preview=None):
         with JOB_LOCK:
             job = JOB_STORE.get(job_id)
-            if job and job.get("status") == "running":
-                job["progress"] = 0 if total == 0 else done / total
-                job["done"] = done
-                job["total"] = total
-                if preview:
-                    job["preview"] = preview
+            if not job or job.get("status") != "running":
+                return
+        payload = {
+            "progress": 0 if total == 0 else done / total,
+            "done": done,
+            "total": total,
+        }
+        if preview:
+            payload["preview"] = preview
+        _publish_job(job_id, **payload)
 
     try:
         with _temp_video_file(video["data"], video["suffix"]) as path:
             result = track_video(
                 path,
                 tuple(req.bbox),
-                tracker_name=req.tracker,
                 start_frame=start_frame,
                 stamp_fps=stamp_fps,
-                clip_duration=req.duration or video.get("duration"),
                 progress=progress,
             )
-        with JOB_LOCK:
-            JOB_STORE[job_id] = {"status": "done", "progress": 1, "result": result}
+        _publish_job(job_id, status="done", progress=1, result=result, preview=None)
     except Exception as exc:
-        with JOB_LOCK:
-            JOB_STORE[job_id] = {"status": "error", "progress": 0, "error": str(exc)}
+        _publish_job(job_id, status="error", progress=0, error=str(exc), preview=None)
 
 
 @app.post("/api/track")
 def start_track(req: TrackRequest):
     if req.video_id not in VIDEO_STORE:
         raise HTTPException(404, "Unknown video.")
-    if req.tracker not in TRACKER_NAMES:
-        raise HTTPException(400, f"Unknown tracker. Choose one of: {', '.join(sorted(TRACKER_NAMES))}")
-    if req.bbox[2] < 8 or req.bbox[3] < 8:
+    if req.bbox[2] < 1 or req.bbox[3] < 1:
         raise HTTPException(400, "Bounding box is too small.")
     if req.fps is not None and (req.fps < 1 or req.fps > 240):
         raise HTTPException(400, "FPS must be between 1 and 240.")
     job_id = uuid.uuid4().hex[:12]
     with JOB_LOCK:
-        JOB_STORE[job_id] = {"status": "running", "progress": 0}
+        JOB_STORE[job_id] = _new_job()
     threading.Thread(target=_run_track, args=(job_id, req), daemon=True).start()
     return {"job_id": job_id}
 
@@ -251,9 +267,51 @@ def start_track(req: TrackRequest):
 def job_status(job_id: str):
     with JOB_LOCK:
         job = JOB_STORE.get(job_id)
-    if not job:
+        snapshot = None if job is None else _public_job(job)
+    if not snapshot:
         raise HTTPException(404, "Unknown job.")
-    return job
+    return snapshot
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def job_events(job_id: str):
+    """Push track progress over one SSE connection instead of polling GET /api/jobs."""
+
+    async def stream():
+        last_seq = -1
+        while True:
+            with JOB_LOCK:
+                job = JOB_STORE.get(job_id)
+                if job is None:
+                    yield f"data: {json.dumps({'status': 'error', 'error': 'Unknown job.'})}\n\n"
+                    return
+                seq = int(job.get("seq") or 0)
+                wake = job.get("wake")
+                payload = _public_job(job)
+            if seq != last_seq:
+                yield f"data: {json.dumps(payload)}\n\n"
+                last_seq = seq
+                if payload.get("status") in ("done", "error"):
+                    return
+                continue
+            if wake is None:
+                await asyncio.sleep(0.25)
+                continue
+            woke = await asyncio.to_thread(wake.wait, 0.5)
+            if woke:
+                wake.clear()
+            else:
+                yield ": keepalive\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/fit")

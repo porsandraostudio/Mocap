@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@500;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=67" />
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <div class="app">
@@ -17,7 +17,7 @@
 
     <section class="source-bar">
       <h2>Source</h2>
-      <div class="row source-actions">
+      <div class="row">
         <label class="btn">
           Upload
           <input type="file" id="fileInput" accept="video/*" hidden />
@@ -29,7 +29,7 @@
     </section>
 
     <main class="stage">
-      <section class="bundle preview-track">
+      <section class="bundle">
         <div class="bundle-head">
           <h2>Preview</h2>
         </div>
@@ -48,14 +48,6 @@
         <div class="track-tools">
           <div class="row">
             <label class="field grow">
-              Tracker
-              <select id="tracker">
-                <option value="lk">Optical flow</option>
-                <option value="ncc">Template match</option>
-                <option value="mil">MIL (OpenCV)</option>
-              </select>
-            </label>
-            <label class="field grow">
               Axis
               <select id="axis">
                 <option value="y">Y</option>
@@ -68,7 +60,6 @@
               <input type="number" id="fps" value="30" min="1" max="240" step="0.01" />
             </label>
           </div>
-          <p class="hint" id="trackerHint">Optical flow follows corners inside the box. Fast; best default for textured motion.</p>
           <div class="row">
             <button type="button" class="btn" id="drawBtn">Draw box</button>
             <button type="button" class="btn primary" id="trackBtn">Track</button>
@@ -80,10 +71,10 @@
         </div>
       </section>
 
-      <section class="bundle curve-export">
+      <section class="bundle">
         <div class="curve-head">
           <h2>Export</h2>
-          <span class="hint" id="fitHint">Track or load JSON. Distance is meters. Black dots are knots.</span>
+          <span class="hint" id="fitHint">Track or load JSON. Distance is meters (exe default 0–0.10). Black dots are knots.</span>
         </div>
         <canvas id="plot"></canvas>
         <div class="export-tools">
@@ -95,12 +86,12 @@
             </label>
             <label class="field grow">
               Curve max (m)
-              <input type="number" id="outMax" value="0.08" step="0.01" />
+              <input type="number" id="outMax" value="0.10" step="0.01" />
             </label>
           </div>
           <label class="field">
-            Smoothing <span id="smoothLabel">1e-5</span>
-            <input type="range" id="smoothing" min="-8" max="-2" step="0.1" value="-5" />
+            Smoothing <span id="smoothLabel">0</span>
+            <input type="range" id="smoothing" min="0" max="500" step="1" value="0" />
           </label>
           <div class="row">
             <button type="button" class="btn" id="csvBtn" disabled>CSV</button>
@@ -114,6 +105,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=67"></script>
+  <script src="/app.js"></script>
 </body>
 </html>
