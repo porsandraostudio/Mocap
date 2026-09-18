@@ -30,11 +30,12 @@ python -m webapp.server --host 127.0.0.1 --port 8765
 
 ## Deploy for free (GitHub Pages)
 
-No Docker and no paid host. Push this repo, then:
+No Docker and no paid host. **GitHub Actions cannot turn Pages on** (`GITHUB_TOKEN` is not allowed to create a Pages site). Do this once as a repo admin:
 
-1. GitHub → **Settings** → **Pages** → Source: **GitHub Actions**
-2. Push to `main` (or run the **Deploy GitHub Pages** workflow)
-3. Open `https://<user>.github.io/<repo>/`
+1. Open [Settings → Pages](https://github.com/porsandraostudio/Mocap/settings/pages)
+2. Under **Build and deployment → Source**, choose **GitHub Actions**
+3. Re-run the **Deploy GitHub Pages** workflow (or push to `main`)
+4. Open **https://porsandraostudio.github.io/Mocap/**
 
 Camera recording needs HTTPS; GitHub Pages provides it. Clips stay in the browser (nothing is uploaded to GitHub).
 
