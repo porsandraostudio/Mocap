@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 32">
+  <rect width="96" height="32" rx="8" fill="#08101c"/>
+  <text
+    x="48"
+    y="22"
+    text-anchor="middle"
+    font-family="Syne, Arial Black, Arial, Helvetica, sans-serif"
+    font-size="18"
+    font-weight="800"
+    fill="#eef3fb"
+    letter-spacing="-0.05em">Mocap</text>
+</svg>

@@ -1,19 +1,6 @@
 /**
  * Mocap UI — upload/record, draw a box, track, fit being Curve, export CSV/JSON.
- * Uses the local FastAPI backend when /api/health is up (OpenCV CSRT).
- * Otherwise tracking + spline fitting run in the browser (GitHub Pages).
- *
- * Naming notes for new developers:
- * - byId(id)                 look up a DOM element by id
- * - state.bbox               selection box [x, y, w, h] in video pixels
- * - state.track              raw tracking result (times + centers + boxes)
- * - state.scaledSeries       series after Curve min/max stretch (meters)
- * - state.fitResult          last fit/load payload used for CSV/JSON download
- * - state.loadedCurveSource  original loaded Curve before height remap
- * - state.hasLoadedCurve     true while UI is working from a loaded JSON Curve
- * - state.mediaTime          frame-accurate playhead from requestVideoFrameCallback
- * - timestampFps()           FPS used to build sample timestamps
- * - rebuildTrackTimestamps() rewrite track.times as i / timestampFps
+ * Tracking (MOSSE) and spline fitting run in the browser.
  */
 "use strict";
 
@@ -26,8 +13,6 @@ const emptyState = document.getElementById("emptyState");
 const videoFrame = document.getElementById("videoFrame");
 
 const state = {
-  backend: false,
-  videoId: null,
   objectUrl: null,
   videoMeta: null,
   isDrawingBox: false,
@@ -40,8 +25,6 @@ const state = {
   loadedCurveSource: null,
   hasResmoothedLoadedCurve: false,
   exportFileName: null,
-  trackPollTimer: null,
-  trackSource: null,
   cameraStream: null,
   recorder: null,
   isLiveCamera: false,
@@ -66,18 +49,13 @@ function formatSeconds(t) {
   return String(Math.max(0, Math.round(Number(t) || 0)));
 }
 
-/** Compact meter values for the Curve min/max inputs. */
-function formatMetersInput(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "0";
-  const rounded = Math.abs(n) < 1e-6 ? 0 : n;
-  const text = rounded.toFixed(4).replace(/\.?0+$/, "");
-  return text === "-0" ? "0" : text;
-}
-
 function formatAxisTick(value, span) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "0";
+  if (span < 1) {
+    const text = n.toFixed(3);
+    return text === "-0.000" ? "0.000" : text;
+  }
   if (span < 10) {
     const text = n.toFixed(1);
     return text === "-0.0" ? "0.0" : text;
@@ -98,7 +76,7 @@ function syncSeekBar() {
   }
   seek.max = duration;
   const current = Number(video.currentTime) || 0;
-  const endSlop = Math.max(0.5, 2 / nativeFps());
+  const endSlop = Math.max(0.5, 2 / clipFps());
   const atEnd = video.ended || current >= duration - endSlop;
   seek.value = atEnd ? duration : Math.min(current, duration);
   byId("timeLabel").textContent = `${formatSeconds(atEnd ? duration : current)} / ${formatSeconds(duration)}`;
@@ -126,44 +104,6 @@ function revokeObjectUrl() {
   if (state.objectUrl) {
     URL.revokeObjectURL(state.objectUrl);
     state.objectUrl = null;
-  }
-}
-
-async function detectBackend() {
-  try {
-    const res = await fetch("api/health", { cache: "no-store" });
-    const data = res.ok ? await res.json().catch(() => null) : null;
-    state.backend = !!(data && data.ok);
-  } catch {
-    state.backend = false;
-  }
-  return state.backend;
-}
-
-let backendReady = null;
-function ensureBackend() {
-  if (!backendReady) backendReady = detectBackend();
-  return backendReady;
-}
-
-function errorMessage(data) {
-  if (!data || typeof data !== "object") return "Request failed";
-  if (typeof data.detail === "string") return data.detail;
-  if (Array.isArray(data.detail)) {
-    return data.detail.map((item) => item.msg || JSON.stringify(item)).join("; ");
-  }
-  if (data.error) return data.error;
-  return "";
-}
-
-function clearTrackPollTimer() {
-  if (state.trackSource) {
-    state.trackSource.close();
-    state.trackSource = null;
-  }
-  if (state.trackPollTimer) {
-    clearTimeout(state.trackPollTimer);
-    state.trackPollTimer = null;
   }
 }
 
@@ -200,15 +140,15 @@ function clipDuration() {
   return media || known || 0;
 }
 
-function nativeFps() {
+/** FPS field: tracking sample rate and curve timestamps. */
+function clipFps() {
+  const value = Number(byId("fps")?.value);
+  if (Number.isFinite(value) && value >= 1 && value <= 240) return value;
   return Number(state.videoMeta?.fps) || 30;
 }
 
-/** FPS from the UI field, used when building track sample timestamps. */
-function timestampFps() {
-  const value = Number(byId("fps")?.value);
-  if (Number.isFinite(value) && value >= 1 && value <= 240) return value;
-  return nativeFps();
+function hasClip() {
+  return Boolean(state.videoMeta) && !state.isLiveCamera;
 }
 
 function formatFps(value) {
@@ -217,10 +157,10 @@ function formatFps(value) {
   return n.toFixed(2).replace(/\.?0+$/, "") || "30";
 }
 
-/** Rebuild track sample times as t = i / timestampFps from the selection frame. */
+/** Rebuild track sample times as t = i / clipFps from the selection frame. */
 function rebuildTrackTimestamps() {
   if (!state.track?.times?.length) return;
-  const fps = timestampFps();
+  const fps = clipFps();
   const times = state.track.times;
   for (let i = 0; i < times.length; i += 1) times[i] = i / fps;
   state.track.fps = fps;
@@ -326,13 +266,13 @@ function currentIndex() {
   if (!state.track || !state.track.times.length) return -1;
   const n = state.track.times.length;
   const start = Number(state.track.start_frame) || 0;
-  const fps = Number(state.track.native_fps) || nativeFps();
+  const fps = Number(state.track.fps) || clipFps();
   const frame = Math.round(displayedTime() * fps);
   return Math.max(0, Math.min(n - 1, frame - start));
 }
 
 function trackSampleVideoTime(startFrame, sampleCount) {
-  const fps = Number(state.track?.native_fps) || nativeFps();
+  const fps = Number(state.track?.fps) || clipFps();
   if (!(fps > 0)) return 0;
   const frame = (Number(startFrame) || 0) + Math.max(1, sampleCount) - 1;
   return frame / fps;
@@ -510,36 +450,9 @@ function drawOverlay() {
 // Curve mapping / plot
 // ---------------------------------------------------------------------------
 
-function curveHeightRange() {
-  return {
-    outMin: Number(byId("outMin").value),
-    outMax: Number(byId("outMax").value),
-    invert: byId("invert").checked,
-  };
-}
-
-/** Stretch tracked pixel values into Curve min/max (meters). */
-function stretchValuesToRange(values, lo, hi, outMin, outMax, invert) {
-  const span = hi - lo || 1;
-  return values.map((v) => {
-    let u = (v - lo) / span;
-    if (invert) u = 1 - u;
-    return outMin + u * (outMax - outMin);
-  });
-}
-
-/** Affine map for BPoly coefficients when remapping a loaded Curve's height. */
-function heightRemapAffine(lo, hi, outMin, outMax, invert) {
-  const span = hi - lo || 1;
-  const d = outMax - outMin;
-  if (invert) return { a: outMin + (hi * d) / span, b: -d / span };
-  const b = d / span;
-  return { a: outMin - lo * b, b };
-}
-
 function formatCsv(times, columns) {
   const names = Object.keys(columns);
-  const lines = [`timestamp [s], ${names.map((name) => `${name} [m]`).join(", ")}`];
+  const lines = [`timestamp [s], ${names.join(", ")}`];
   times.forEach((t, i) => {
     const vals = names.map((name) => Number(columns[name][i]).toFixed(6)).join(", ");
     lines.push(`${Number(t).toFixed(3)}, ${vals}`);
@@ -547,74 +460,36 @@ function formatCsv(times, columns) {
   return `${lines.join("\n")}\n`;
 }
 
-function trackedSeriesInMeters() {
+function invertValues(values) {
+  const h = Number(state.track?.height) || 0;
+  return values.map((v) => h - v);
+}
+
+function trackedSeries() {
   if (!state.track) return null;
-  const { outMin, outMax, invert } = curveHeightRange();
-  const project = (values, flip) => {
-    const lo = Math.min(...values);
-    const hi = Math.max(...values);
-    return stretchValuesToRange(values, lo, hi, outMin, outMax, flip);
-  };
+  const invert = byId("invert").checked;
   const series = {};
   const axis = byId("axis").value;
-  // Invert flips image Y only, then stretch min→0 / max→amplitude.
-  if (axis === "x" || axis === "xy") series.x = project(state.track.x, false);
-  if (axis === "y" || axis === "xy") series.y = project(state.track.y, invert);
+  if (axis === "x" || axis === "xy") series.x = state.track.x.slice();
+  if (axis === "y" || axis === "xy") {
+    series.y = invert ? invertValues(state.track.y) : state.track.y.slice();
+  }
   return { times: state.track.times.slice(), series };
 }
 
-/** Remap a loaded Curve into the current Curve min/max (and optional invert). */
-function remapLoadedCurveHeight() {
-  if (!state.loadedCurveSource) return;
-  const { outMin, outMax, invert } = curveHeightRange();
-  if (!Number.isFinite(outMin) || !Number.isFinite(outMax)) return;
-  const keys = Object.keys(state.loadedCurveSource.dense);
-  const dense = {};
-  const knotValues = {};
-  let curveObj = null;
-  try {
-    curveObj = JSON.parse(state.loadedCurveSource.curve);
-  } catch {
-    curveObj = null;
-  }
-  keys.forEach((key, idx) => {
-    const src = state.loadedCurveSource.dense[key];
-    const lo = Math.min(...src);
-    const hi = Math.max(...src);
-    dense[key] = stretchValuesToRange(src, lo, hi, outMin, outMax, invert);
-    knotValues[key] = stretchValuesToRange(
-      state.loadedCurveSource.knot_values[key],
-      lo,
-      hi,
-      outMin,
-      outMax,
-      invert,
-    );
-    if (curveObj?.splines?.[idx]?.coefficients) {
-      const { a, b } = heightRemapAffine(lo, hi, outMin, outMax, invert);
-      curveObj.splines[idx].coefficients = curveObj.splines[idx].coefficients.map((row) => (
-        row.map((coef) => a + b * coef)
-      ));
-    }
-  });
-  state.scaledSeries = { times: state.loadedCurveSource.dense_times, series: dense };
-  state.fitResult = {
-    ...state.loadedCurveSource.payload,
-    dense,
-    dense_times: state.loadedCurveSource.dense_times,
-    knot_times: state.loadedCurveSource.knot_times,
-    knot_values: knotValues,
-    csv: formatCsv(state.loadedCurveSource.knot_times, knotValues),
-    curve: curveObj ? JSON.stringify(curveObj, null, 4) : state.loadedCurveSource.curve,
+function applyLoadedSeries() {
+  if (!state.loadedCurveSource) return null;
+  state.scaledSeries = {
+    times: state.loadedCurveSource.dense_times,
+    series: state.loadedCurveSource.dense,
   };
+  state.fitResult = { ...state.loadedCurveSource.payload };
+  return state.scaledSeries;
 }
 
 function seriesReadyForFit() {
-  if (state.loadedCurveSource) {
-    remapLoadedCurveHeight();
-    return state.scaledSeries;
-  }
-  return trackedSeriesInMeters();
+  if (state.loadedCurveSource) return applyLoadedSeries();
+  return trackedSeries();
 }
 
 function drawPlot() {
@@ -627,7 +502,7 @@ function drawPlot() {
   plotCtx.fillStyle = "#f6f7f9";
   plotCtx.fillRect(0, 0, cssW, cssH);
 
-  const left = 52;
+  const left = 70;
   const right = 16;
   const top = 16;
   const bottom = 36;
@@ -636,10 +511,16 @@ function drawPlot() {
 
   plotCtx.fillStyle = "#6b7788";
   plotCtx.font = "11px 'IBM Plex Mono', monospace";
-  plotCtx.fillText("distance (m)", 8, 14);
+  plotCtx.save();
+  plotCtx.translate(12, top + plotH / 2);
+  plotCtx.rotate(-Math.PI / 2);
+  plotCtx.textAlign = "center";
+  plotCtx.textBaseline = "middle";
+  plotCtx.fillText(state.hasLoadedCurve ? "value" : "pixels", 0, 0);
+  plotCtx.restore();
   plotCtx.fillText("duration (s)", cssW - 92, cssH - 10);
 
-  const data = (!state.hasLoadedCurve && trackedSeriesInMeters()) || state.scaledSeries;
+  const data = (!state.hasLoadedCurve && trackedSeries()) || state.scaledSeries;
   if (!data) {
     plotCtx.strokeStyle = "#c9d0d9";
     plotCtx.beginPath();
@@ -656,11 +537,6 @@ function drawPlot() {
   const t1 = data.times[data.times.length - 1] || 1;
   let yMin = Math.min(...all);
   let yMax = Math.max(...all);
-  const { outMin, outMax } = curveHeightRange();
-  if (Number.isFinite(outMin) && Number.isFinite(outMax) && outMax !== outMin) {
-    yMin = Math.min(outMin, yMin);
-    yMax = Math.max(outMax, yMax);
-  }
   if (yMax === yMin) {
     yMin -= 0.01;
     yMax += 0.01;
@@ -683,7 +559,9 @@ function drawPlot() {
     plotCtx.lineTo(left + plotW, y);
     plotCtx.stroke();
     plotCtx.fillStyle = "#6b7788";
-    plotCtx.fillText(yv.toFixed(3), 6, y + 3);
+    plotCtx.textAlign = "right";
+    plotCtx.fillText(formatAxisTick(yv, yMax - yMin), left - 8, y + 3);
+    plotCtx.textAlign = "left";
     if (i > 0) plotCtx.fillText(formatAxisTick(xv, t1 - t0), x - 8, top + plotH + 16);
   }
 
@@ -754,25 +632,6 @@ function setClipMeta(text) {
   byId("clipMeta").textContent = text;
 }
 
-async function uploadFile(file, extras = {}) {
-  await ensureBackend();
-  if (!state.backend) {
-    attachLocalFile(file, extras);
-    return;
-  }
-  const body = new FormData();
-  body.append("file", file);
-  byId("sourceHint").textContent = "Uploading…";
-  const res = await fetch("api/upload", { method: "POST", body });
-  if (!res.ok) {
-    byId("sourceHint").textContent = errorMessage(await res.json().catch(() => ({}))) || `Upload failed (${res.status})`;
-    return;
-  }
-  const meta = await res.json();
-  if (extras.duration && !(meta.duration > 0)) meta.duration = extras.duration;
-  attachVideo(meta);
-}
-
 function attachLocalFile(file, extras = {}) {
   byId("sourceHint").textContent = "Loading clip…";
   revokeObjectUrl();
@@ -792,7 +651,6 @@ function attachLocalFile(file, extras = {}) {
     const size = MocapTrack.trackFrameSize(vw, vh);
     const duration = extras.duration || mediaDuration();
     attachVideo({
-      id: "local",
       name: file.name || "clip",
       width: vw,
       height: vh,
@@ -813,9 +671,6 @@ function attachLocalFile(file, extras = {}) {
 function attachVideo(meta, srcUrl) {
   stopCamera();
   clearLivePreview();
-  clearTrackPollTimer();
-  const resetHeightFromCurve = state.hasLoadedCurve;
-  state.videoId = meta.id;
   state.videoMeta = meta;
   state.track = null;
   state.scaledSeries = null;
@@ -825,29 +680,19 @@ function attachVideo(meta, srcUrl) {
   state.exportFileName = null;
   state.bbox = null;
   state.isTracking = false;
+  setBoxDrawing(false);
   clearFitResult();
-  if (resetHeightFromCurve) {
-    byId("outMin").value = "0";
-    byId("outMax").value = "0.10";
-  }
   byId("invert").checked = true;
   if (byId("fps")) byId("fps").value = formatFps(meta.fps || 30);
-  if (srcUrl) {
-    if (video.src !== srcUrl) {
-      video.removeAttribute("src");
-      video.srcObject = null;
-      video.src = srcUrl;
-    }
-  } else {
-    revokeObjectUrl();
+  if (srcUrl && video.src !== srcUrl) {
     video.removeAttribute("src");
     video.srcObject = null;
-    video.src = `api/video/${meta.id}/file`;
+    video.src = srcUrl;
   }
   video.muted = true;
-  emptyState.textContent = "Upload a clip or use the camera, then drag a box around the thing you want to follow.";
+  emptyState.textContent = "Drop a video here, or use Upload / Camera, then draw a box around the thing you want to follow.";
   emptyState.classList.add("hidden");
-  setClipMeta(`${meta.name}  ·  ${clipSizeLabel(meta)}  ·  ${timestampFps().toFixed(2)} fps  ·  ${formatSeconds(meta.duration)}s`);
+  setClipMeta(`${meta.name}  ·  ${clipSizeLabel(meta)}  ·  ${clipFps().toFixed(2)} fps  ·  ${formatSeconds(meta.duration)}s`);
   byId("sourceHint").textContent = "";
   byId("seek").max = meta.duration || 0;
   byId("seek").disabled = false;
@@ -874,7 +719,7 @@ function refreshClipMeta() {
   const known = Number(state.videoMeta.duration) || 0;
   // Only grow duration. A partial WebM buffer must not replace the recording length.
   const duration = media > known ? media : (known || media);
-  const fps = timestampFps();
+  const fps = clipFps();
   state.videoMeta.duration = duration;
   setClipMeta(`${state.videoMeta.name}  ·  ${clipSizeLabel(state.videoMeta)}  ·  ${fps.toFixed(2)} fps  ·  ${formatSeconds(duration)}s`);
   if (!state.isLiveCamera) {
@@ -964,87 +809,28 @@ function applyTrackPreview(preview) {
   if (preview.width) state.track.width = preview.width;
   if (preview.height) state.track.height = preview.height;
   if (preview.fps) state.track.fps = preview.fps;
-  if (preview.native_fps) state.track.native_fps = preview.native_fps;
   if (preview.start_frame != null) state.track.start_frame = preview.start_frame;
 }
 
-function applyTrackJob(job) {
-  const pct = Math.round((job.progress || 0) * 100);
-  byId("progressBar").style.width = `${pct}%`;
-  byId("progressText").textContent = job.status === "running"
-    ? `Tracking ${pct}%`
-    : job.status;
-  if (job.status === "running") {
-    if (job.preview) {
-      applyTrackPreview(job.preview);
-      const n = job.preview.n || state.track.times.length;
-      const seeked = seekToTrackSample(job.preview.start_frame, n);
-      if (!seeked) drawOverlay();
-    }
-    return;
-  }
+function failTracking(message) {
   state.isTracking = false;
-  state.trackPollTimer = null;
   byId("progressWrap").classList.remove("hidden");
-  if (job.status === "error") {
-    byId("progressText").textContent = job.error || "Tracking failed";
-    drawOverlay();
-    return;
-  }
-  if (!job.result) return;
-  state.track = job.result;
+  byId("progressText").textContent = message || "Tracking failed";
+  drawOverlay();
+}
+
+function finishTracking(result) {
+  state.isTracking = false;
+  state.track = result;
   rebuildTrackTimestamps();
   clearFitResult();
-  byId("progressText").textContent = `Tracked ${job.result.times.length} frames, lost ${job.result.lost}`;
+  byId("progressWrap").classList.remove("hidden");
+  byId("progressText").textContent = `Tracked ${result.times.length} frames, lost ${result.lost}`;
   const seeking = seekToTrackSample(state.track.start_frame, state.track.times.length);
   syncSeekBar();
   if (!seeking) drawOverlay();
   drawPlot();
   scheduleSplineFit();
-}
-
-function watchTrackJob(jobId) {
-  clearTrackPollTimer();
-  if (typeof EventSource === "undefined") {
-    pollTrackJob(jobId);
-    return;
-  }
-  const es = new EventSource(`api/jobs/${jobId}/events`);
-  state.trackSource = es;
-  es.onmessage = (ev) => {
-    let job;
-    try {
-      job = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    applyTrackJob(job);
-    if (job.status === "done" || job.status === "error") {
-      es.close();
-      if (state.trackSource === es) state.trackSource = null;
-    }
-  };
-  es.onerror = () => {
-    if (state.trackSource !== es) return;
-    es.close();
-    state.trackSource = null;
-    if (state.isTracking) pollTrackJob(jobId);
-  };
-}
-
-async function pollTrackJob(jobId) {
-  try {
-    const res = await fetch(`api/jobs/${jobId}`);
-    const job = await res.json();
-    applyTrackJob(job);
-    if (job.status === "running" && state.isTracking) {
-      state.trackPollTimer = setTimeout(() => pollTrackJob(jobId), 400);
-    }
-  } catch {
-    if (state.isTracking) {
-      state.trackPollTimer = setTimeout(() => pollTrackJob(jobId), 400);
-    }
-  }
 }
 
 /** UI smoothing 0–500 maps to being.spline s via / 1e7 (100 → 1e-5). */
@@ -1077,28 +863,10 @@ async function runSplineFit() {
   }
   byId("fitHint").textContent = "Fitting spline…";
   try {
-    let data;
-    if (state.backend) {
-      const res = await fetch("api/fit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          times: mapped.times,
-          series: mapped.series,
-          smoothing: currentSmoothing(),
-        }),
-      });
-      data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        byId("fitHint").textContent = errorMessage(data) || `Fit failed (${res.status})`;
-        return;
-      }
-    } else {
-      const names = Object.keys(mapped.series);
-      const splines = names.map((name) => MocapSpline.fitSpline(mapped.times, mapped.series[name], currentSmoothing()));
-      data = MocapSpline.exportPayload(splines, names);
-      data.csv = formatCsv(mapped.times, mapped.series);
-    }
+    const names = Object.keys(mapped.series);
+    const splines = names.map((name) => MocapSpline.fitSpline(mapped.times, mapped.series[name], currentSmoothing()));
+    const data = MocapSpline.exportPayload(splines, names);
+    data.csv = formatCsv(mapped.times, mapped.series);
     state.scaledSeries = mapped;
     state.fitResult = data;
     const durationSec = Number(data.duration);
@@ -1108,7 +876,7 @@ async function runSplineFit() {
     if (fromLoaded) {
       state.hasLoadedCurve = true;
       state.hasResmoothedLoadedCurve = true;
-      byId("fitHint").textContent = `${data.knots} knots${durationLabel}, height ${byId("outMin").value}–${byId("outMax").value} m`;
+      byId("fitHint").textContent = `${data.knots} knots${durationLabel}`;
     } else {
       state.hasLoadedCurve = false;
       state.loadedCurveSource = null;
@@ -1165,13 +933,12 @@ overlay.addEventListener("pointercancel", endBoxDrawing);
 window.addEventListener("pointerup", endBoxDrawing);
 window.addEventListener("pointercancel", endBoxDrawing);
 
-byId("drawBtn").onclick = () => {
-  if (!state.videoId) return;
+byId("drawBtn").addEventListener("click", () => {
+  if (!hasClip()) return;
   if (!video.videoWidth) {
     byId("sourceHint").textContent = "The player cannot decode this clip, so you cannot draw a box. Re-export as H.264 MP4 or WebM.";
     return;
   }
-  clearTrackPollTimer();
   state.isTracking = false;
   state.track = null;
   state.scaledSeries = null;
@@ -1181,9 +948,9 @@ byId("drawBtn").onclick = () => {
   setBoxDrawing(true);
   drawOverlay();
   drawPlot();
-};
+});
 
-byId("playBtn").onclick = () => {
+byId("playBtn").addEventListener("click", () => {
   if (state.isLiveCamera) return;
   if (video.paused) {
     video.play().then(syncPlayButton).catch((err) => {
@@ -1194,12 +961,12 @@ byId("playBtn").onclick = () => {
     video.pause();
     syncPlayButton();
   }
-};
+});
 
-byId("seek").oninput = () => {
+byId("seek").addEventListener("input", () => {
   if (state.isLiveCamera) return;
   video.currentTime = Number(byId("seek").value);
-};
+});
 
 video.addEventListener("timeupdate", () => {
   if (state.isLiveCamera) return;
@@ -1234,7 +1001,7 @@ video.addEventListener("ended", () => {
 });
 
 video.addEventListener("error", () => {
-  if (state.isLiveCamera || !state.videoId) return;
+  if (state.isLiveCamera || !hasClip()) return;
   emptyState.textContent = "This browser cannot play this clip (unsupported codec). Re-export as H.264 MP4 or WebM.";
   emptyState.classList.remove("hidden");
   byId("sourceHint").textContent = "Clip uploaded, but the player cannot decode it. Use H.264 MP4 or WebM.";
@@ -1249,31 +1016,30 @@ video.addEventListener("loadedmetadata", () => {
 video.addEventListener("durationchange", refreshClipMeta);
 video.addEventListener("progress", refreshClipMeta);
 
-byId("trackBtn").onclick = async () => {
-  if (!state.videoId || !state.bbox) {
+byId("trackBtn").addEventListener("click", async () => {
+  if (!hasClip() || !state.bbox) {
     byId("sourceHint").textContent = "Load a clip and draw a box first.";
     return;
   }
   const box = state.bbox;
   const duration = clipDuration();
-  const fileFps = nativeFps();
+  const fps = clipFps();
   let startTime = displayedTime();
-  if (duration > 0) startTime = Math.min(startTime, Math.max(0, duration - 1 / fileFps));
+  if (duration > 0) startTime = Math.min(startTime, Math.max(0, duration - 1 / fps));
   const trackBox = nativeToTrackBox(box);
   const tw = Number(state.videoMeta?.track_width) || video.videoWidth;
   const th = Number(state.videoMeta?.track_height) || video.videoHeight;
-  clearTrackPollTimer();
   state.isTracking = true;
   state.trackSeekPending = false;
   state.track = {
     times: [0],
-    x: [trackBox[0] + Math.floor(trackBox[2] / 2)],
-    y: [trackBox[1] + Math.floor(trackBox[3] / 2)],
+    x: [trackBox[0] + trackBox[2] / 2],
+    y: [trackBox[1] + trackBox[3] / 2],
     bboxes: [trackBox.slice()],
     width: tw,
     height: th,
-    native_fps: fileFps,
-    start_frame: Math.round(startTime * fileFps),
+    fps,
+    start_frame: Math.round(startTime * fps),
     lost: 0,
   };
   state.hasLoadedCurve = false;
@@ -1286,50 +1052,28 @@ byId("trackBtn").onclick = async () => {
   byId("progressWrap").classList.remove("hidden");
   byId("progressBar").style.width = "0%";
   byId("progressText").textContent = "Starting…";
-  await ensureBackend();
-  if (!state.backend) {
-    try {
-      const result = await MocapTrack.trackHtmlVideo(video, {
-        bbox: state.bbox,
-        startTime,
-        nativeFps: fileFps,
-        timestampFps: timestampFps(),
-        shouldStop: () => !state.isTracking,
-        onProgress: (preview, done, total) => {
-          const pct = Math.round((total ? done / total : 0) * 100);
-          byId("progressBar").style.width = `${pct}%`;
-          byId("progressText").textContent = `Tracking ${pct}%`;
-          applyTrackPreview(preview);
-          drawOverlay();
-        },
-      });
-      if (!state.isTracking) return;
-      applyTrackJob({ status: "done", progress: 1, result });
-    } catch (err) {
-      applyTrackJob({ status: "error", progress: 0, error: err.message || "Tracking failed" });
-    }
-    return;
-  }
-  const res = await fetch("api/track", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      video_id: state.videoId,
+  try {
+    const result = await MocapTrack.trackHtmlVideo(video, {
       bbox: state.bbox,
-      start_time: startTime,
-      fps: timestampFps(),
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    state.isTracking = false;
-    byId("progressText").textContent = errorMessage(data);
-    return;
+      startTime,
+      fps,
+      shouldStop: () => !state.isTracking,
+      onProgress: (preview, done, total) => {
+        const pct = Math.round((total ? done / total : 0) * 100);
+        byId("progressBar").style.width = `${pct}%`;
+        byId("progressText").textContent = `Tracking ${pct}%`;
+        applyTrackPreview(preview);
+        drawOverlay();
+      },
+    });
+    if (!state.isTracking) return;
+    finishTracking(result);
+  } catch (err) {
+    failTracking(err.message || "Tracking failed");
   }
-  watchTrackJob(data.job_id);
-};
+});
 
-byId("smoothing").oninput = () => {
+byId("smoothing").addEventListener("input", () => {
   byId("smoothLabel").textContent = formatSmoothing(currentSmoothing());
   if (state.hasLoadedCurve) {
     byId("fitHint").textContent = "Smoothing loaded curve…";
@@ -1339,17 +1083,11 @@ byId("smoothing").oninput = () => {
   state.scaledSeries = null;
   clearFitResult();
   scheduleSplineFit();
-};
+});
 
-["axis", "invert", "outMin", "outMax"].forEach((id) => {
+["axis", "invert"].forEach((id) => {
   byId(id).addEventListener("input", () => {
-    if (state.hasLoadedCurve) {
-      remapLoadedCurveHeight();
-      drawPlot();
-      if (state.hasResmoothedLoadedCurve) scheduleSplineFit();
-      else byId("fitHint").textContent = `Height ${byId("outMin").value}–${byId("outMax").value} m`;
-      return;
-    }
+    if (state.hasLoadedCurve) return;
     state.scaledSeries = null;
     clearFitResult();
     drawOverlay();
@@ -1372,33 +1110,80 @@ byId("fps").addEventListener("input", () => {
   scheduleSplineFit();
 });
 
-byId("csvBtn").onclick = () => {
+byId("csvBtn").addEventListener("click", () => {
   if (!state.fitResult) return;
   download(`${exportBasename()}.csv`, state.fitResult.csv, "text/csv");
-};
+});
 
-byId("jsonBtn").onclick = () => {
+byId("jsonBtn").addEventListener("click", () => {
   if (!state.fitResult) return;
   download(`${exportBasename()}.json`, state.fitResult.curve, "application/json");
-};
+});
 
-byId("fileInput").onchange = (event) => {
+byId("fileInput").addEventListener("change", (event) => {
   const file = event.target.files?.[0];
   event.target.value = "";
-  if (file) uploadFile(file);
-};
+  if (file) attachLocalFile(file);
+});
+
+function isVideoFile(file) {
+  if (!file) return false;
+  if (file.type && file.type.startsWith("video/")) return true;
+  return /\.(mp4|m4v|mov|webm|avi|mkv|ogv)$/i.test(file.name || "");
+}
+
+function videoFromDrop(event) {
+  const files = [...(event.dataTransfer?.files || [])];
+  return files.find(isVideoFile) || null;
+}
+
+let dropDepth = 0;
+function setDropHover(on) {
+  videoFrame.classList.toggle("drop-hover", on);
+}
+
+window.addEventListener("dragover", (event) => {
+  event.preventDefault();
+});
+window.addEventListener("drop", (event) => {
+  event.preventDefault();
+});
+
+videoFrame.addEventListener("dragenter", (event) => {
+  event.preventDefault();
+  dropDepth += 1;
+  setDropHover(true);
+});
+videoFrame.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+});
+videoFrame.addEventListener("dragleave", () => {
+  dropDepth = Math.max(0, dropDepth - 1);
+  if (dropDepth === 0) setDropHover(false);
+});
+videoFrame.addEventListener("drop", (event) => {
+  event.preventDefault();
+  dropDepth = 0;
+  setDropHover(false);
+  if (state.isLiveCamera || state.recorder) {
+    byId("sourceHint").textContent = "Stop recording before dropping a clip.";
+    return;
+  }
+  const file = videoFromDrop(event);
+  if (!file) {
+    byId("sourceHint").textContent = "Drop a video file (MP4, MOV, or WebM).";
+    return;
+  }
+  attachLocalFile(file);
+});
 
 function applyLoadedCurve(data, fileName) {
   state.hasLoadedCurve = true;
   state.hasResmoothedLoadedCurve = false;
   state.exportFileName = data.name || fileName;
-  const series = data.dense || {};
-  const primary = series[data.primary] || series.y || Object.values(series)[0] || [];
-  const lo = primary.length ? Math.min(...primary) : 0;
-  const hi = primary.length ? Math.max(...primary) : 0.10;
-  byId("outMin").value = formatMetersInput(lo);
-  byId("outMax").value = formatMetersInput(hi);
   byId("invert").checked = false;
+  data.csv = data.csv || formatCsv(data.knot_times, data.knot_values);
   state.loadedCurveSource = {
     curve: data.curve,
     dense: data.dense,
@@ -1407,44 +1192,31 @@ function applyLoadedCurve(data, fileName) {
     knot_values: data.knot_values,
     payload: data,
   };
-  remapLoadedCurveHeight();
+  applyLoadedSeries();
   byId("csvBtn").disabled = false;
   byId("jsonBtn").disabled = false;
-  byId("fitHint").textContent = `Loaded ${data.knots} knots. Smoothing and Curve min/max still apply.`;
+  byId("fitHint").textContent = `Loaded ${data.knots} knots. Smoothing still applies.`;
   drawPlot();
 }
 
-byId("jsonInput").onchange = async (event) => {
+byId("jsonInput").addEventListener("change", async (event) => {
   const file = event.target.files?.[0];
   event.target.value = "";
   if (!file) return;
   byId("fitHint").textContent = "Loading curve…";
   try {
-    await ensureBackend();
-    let data;
-    if (state.backend) {
-      const body = new FormData();
-      body.append("file", file);
-      const res = await fetch("api/load-curve", { method: "POST", body });
-      data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        byId("fitHint").textContent = errorMessage(data) || `Could not load JSON (${res.status})`;
-        return;
-      }
-    } else {
-      const text = await file.text();
-      const splines = MocapSpline.curveFromJson(text);
-      const names = MocapSpline.splineAxisNames(splines.length);
-      data = MocapSpline.exportPayload(splines, names, text);
-      data.name = file.name;
-    }
+    const text = await file.text();
+    const splines = MocapSpline.curveFromJson(text);
+    const names = MocapSpline.splineAxisNames(splines.length);
+    const data = MocapSpline.exportPayload(splines, names, text);
+    data.name = file.name;
     applyLoadedCurve(data, file.name);
   } catch (err) {
     byId("fitHint").textContent = err.message || "Could not load JSON";
   }
-};
+});
 
-byId("camBtn").onclick = async () => {
+byId("camBtn").addEventListener("click", async () => {
   if (state.recorder) {
     byId("sourceHint").textContent = "Stopping recording…";
     byId("camBtn").textContent = "Camera";
@@ -1479,7 +1251,7 @@ byId("camBtn").onclick = async () => {
         return;
       }
       const file = new File([blob], "camera.webm", { type: blob.type });
-      uploadFile(file, { duration: elapsed });
+      attachLocalFile(file, { duration: elapsed });
     };
     rec.start(250);
     startRecClock();
@@ -1490,7 +1262,7 @@ byId("camBtn").onclick = async () => {
     clearLivePreview();
     byId("sourceHint").textContent = err.message;
   }
-};
+});
 
 window.addEventListener("resize", () => {
   resizeOverlay();
@@ -1506,4 +1278,3 @@ window.addEventListener("keydown", (event) => {
 
 resizeOverlay();
 drawPlot();
-ensureBackend();

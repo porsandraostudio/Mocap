@@ -1,17 +1,16 @@
 /**
- * In-browser box tracker for GitHub Pages / static hosting.
- *
- * MOSSE correlation filter (Bolme 2010) on 640-capped grayscale frames.
- * Stops when peak-to-sidelobe ratio says the target is lost — same control
- * flow as the Python CSRT path, not the same filter.
+ * In-browser MOSSE box tracker (Bolme 2010) on 640-capped grayscale frames.
+ * Stops when peak-to-sidelobe ratio says the target is lost.
  */
 "use strict";
 
 const MocapTrack = (() => {
   const TRACK_MAX_SIDE = 640;
   const FILTER = 64;
-  const LEARNING = 0.125;
-  const PSR_MIN = 5.5;
+  const LEARNING = 0.08;
+  const PSR_MIN = 5.0;
+  const WINDOW_PAD = 2;
+  const INIT_SAMPLES = 8;
   const EPS = 1e-5;
 
   function trackFrameSize(width, height, maxSide = TRACK_MAX_SIDE) {
@@ -42,17 +41,66 @@ const MocapTrack = (() => {
   }
 
   function clampBbox(bbox, frameW, frameH) {
-    let [x, y, w, h] = bbox.map((v) => Math.floor(v));
-    x = Math.max(0, Math.min(x, Math.max(0, frameW - 1)));
-    y = Math.max(0, Math.min(y, Math.max(0, frameH - 1)));
+    let [x, y, w, h] = bbox.map(Number);
+    w = Math.max(1, w);
+    h = Math.max(1, h);
+    x = Math.max(0, Math.min(x, Math.max(0, frameW - w)));
+    y = Math.max(0, Math.min(y, Math.max(0, frameH - h)));
     w = Math.max(1, Math.min(w, frameW - x));
     h = Math.max(1, Math.min(h, frameH - y));
     return [x, y, w, h];
   }
 
   function boxCenter(box) {
-    const [x, y, w, h] = box.map((v) => Math.floor(v));
-    return [x + Math.floor(w / 2), y + Math.floor(h / 2)];
+    return [box[0] + box[2] / 2, box[1] + box[3] / 2];
+  }
+
+  function subpixelOffset(resp, w, h, px, py) {
+    const at = (x, y) => resp[(((y % h) + h) % h) * w + (((x % w) + w) % w)];
+    const c = at(px, py);
+    const l = at(px - 1, py);
+    const r = at(px + 1, py);
+    const u = at(px, py - 1);
+    const d = at(px, py + 1);
+    const denX = l - 2 * c + r;
+    const denY = u - 2 * c + d;
+    const dx = denX ? (0.5 * (l - r)) / denX : 0;
+    const dy = denY ? (0.5 * (u - d)) / denY : 0;
+    return {
+      dx: Math.max(-1, Math.min(1, dx)),
+      dy: Math.max(-1, Math.min(1, dy)),
+    };
+  }
+
+  class OneEuro {
+    constructor(freq, minCutoff = 1.7, beta = 0.35, dCutoff = 1) {
+      this.freq = Math.max(1, freq);
+      this.minCutoff = minCutoff;
+      this.beta = beta;
+      this.dCutoff = dCutoff;
+      this.xHat = null;
+      this.dxHat = 0;
+    }
+
+    alpha(cutoff) {
+      const tau = 1 / (2 * Math.PI * cutoff);
+      const te = 1 / this.freq;
+      return 1 / (1 + tau / te);
+    }
+
+    filter(value) {
+      if (this.xHat == null) {
+        this.xHat = value;
+        return value;
+      }
+      const dx = (value - this.xHat) * this.freq;
+      const aD = this.alpha(this.dCutoff);
+      this.dxHat = aD * dx + (1 - aD) * this.dxHat;
+      const cutoff = this.minCutoff + this.beta * Math.abs(this.dxHat);
+      const a = this.alpha(cutoff);
+      this.xHat = a * value + (1 - a) * this.xHat;
+      return this.xHat;
+    }
   }
 
   function fft(re, im, invert) {
@@ -173,25 +221,27 @@ const MocapTrack = (() => {
     return out;
   }
 
-  function samplePatch(gray, frameW, frameH, cx, cy, w, h) {
-    const patch = new Float64Array(w * h);
-    const x0 = cx - (w - 1) / 2;
-    const y0 = cy - (h - 1) / 2;
-    for (let y = 0; y < h; y += 1) {
-      const fy = y0 + y;
+  function sampleWindow(gray, frameW, frameH, cx, cy, winW, winH, outW, outH) {
+    const patch = new Float64Array(outW * outH);
+    const stepX = winW / outW;
+    const stepY = winH / outH;
+    const x0 = cx - winW / 2 + stepX / 2;
+    const y0 = cy - winH / 2 + stepY / 2;
+    const g = (ix, iy) => {
+      if (ix < 0 || iy < 0 || ix >= frameW || iy >= frameH) return 0;
+      return gray[iy * frameW + ix];
+    };
+    for (let y = 0; y < outH; y += 1) {
+      const fy = y0 + y * stepY;
       const y1 = Math.floor(fy);
       const y2 = y1 + 1;
       const wy = fy - y1;
-      for (let x = 0; x < w; x += 1) {
-        const fx = x0 + x;
+      for (let x = 0; x < outW; x += 1) {
+        const fx = x0 + x * stepX;
         const x1 = Math.floor(fx);
         const x2 = x1 + 1;
         const wx = fx - x1;
-        const g = (ix, iy) => {
-          if (ix < 0 || iy < 0 || ix >= frameW || iy >= frameH) return 0;
-          return gray[iy * frameW + ix];
-        };
-        patch[y * w + x] = (1 - wy) * ((1 - wx) * g(x1, y1) + wx * g(x2, y1))
+        patch[y * outW + x] = (1 - wy) * ((1 - wx) * g(x1, y1) + wx * g(x2, y1))
           + wy * ((1 - wx) * g(x1, y2) + wx * g(x2, y2));
       }
     }
@@ -223,8 +273,14 @@ const MocapTrack = (() => {
       this.bIm = new Float64Array(this.w * this.h);
       this.cx = 0;
       this.cy = 0;
+      this.outX = 0;
+      this.outY = 0;
       this.boxW = 1;
       this.boxH = 1;
+      this.winW = FILTER;
+      this.winH = FILTER;
+      this.smoothX = null;
+      this.smoothY = null;
     }
 
     _accumulate(fRe, fIm, rate) {
@@ -241,7 +297,10 @@ const MocapTrack = (() => {
     }
 
     _filterFromPatch(gray, frameW, frameH) {
-      const patch = samplePatch(gray, frameW, frameH, this.cx, this.cy, this.w, this.h);
+      const patch = sampleWindow(
+        gray, frameW, frameH,
+        this.cx, this.cy, this.winW, this.winH, this.w, this.h,
+      );
       const pre = preprocess(patch, this.win);
       const re = pre;
       const im = new Float64Array(this.w * this.h);
@@ -249,28 +308,58 @@ const MocapTrack = (() => {
       return { re, im };
     }
 
-    init(imageData, bbox) {
+    _box() {
+      return clampBbox(
+        [this.outX - this.boxW / 2, this.outY - this.boxH / 2, this.boxW, this.boxH],
+        this.frameW,
+        this.frameH,
+      );
+    }
+
+    init(imageData, bbox, fps = 30) {
       const frameW = imageData.width;
       const frameH = imageData.height;
+      this.frameW = frameW;
+      this.frameH = frameH;
       const gray = rgbaToGray(imageData);
       const box = clampBbox(bbox, frameW, frameH);
       const [cx, cy] = boxCenter(box);
       this.cx = cx;
       this.cy = cy;
+      this.outX = cx;
+      this.outY = cy;
       this.boxW = box[2];
       this.boxH = box[3];
+      this.winW = Math.max(8, this.boxW * WINDOW_PAD);
+      this.winH = Math.max(8, this.boxH * WINDOW_PAD);
+      this.smoothX = new OneEuro(fps);
+      this.smoothY = new OneEuro(fps);
       this.aRe.fill(0);
       this.aIm.fill(0);
       this.bRe.fill(0);
       this.bIm.fill(0);
       const { re, im } = this._filterFromPatch(gray, frameW, frameH);
       this._accumulate(re, im, 1);
+      const savedX = this.cx;
+      const savedY = this.cy;
+      for (let i = 0; i < INIT_SAMPLES; i += 1) {
+        this.cx = savedX + (Math.random() - 0.5) * 0.08 * this.winW;
+        this.cy = savedY + (Math.random() - 0.5) * 0.08 * this.winH;
+        const sample = this._filterFromPatch(gray, frameW, frameH);
+        this._accumulate(sample.re, sample.im, 1 / (i + 2));
+      }
+      this.cx = savedX;
+      this.cy = savedY;
+      this.outX = this.smoothX.filter(this.cx);
+      this.outY = this.smoothY.filter(this.cy);
       return true;
     }
 
     update(imageData) {
       const frameW = imageData.width;
       const frameH = imageData.height;
+      this.frameW = frameW;
+      this.frameH = frameH;
       const gray = rgbaToGray(imageData);
       const { re: fRe, im: fIm } = this._filterFromPatch(gray, frameW, frameH);
       const n = this.w * this.h;
@@ -316,18 +405,29 @@ const MocapTrack = (() => {
       const psr = (peak - mean) / std;
       if (psr < PSR_MIN) return { ok: false, box: [0, 0, 0, 0] };
 
-      this.cx += px - (this.w - 1) / 2;
-      this.cy += py - (this.h - 1) / 2;
-      this.cx = Math.max(0, Math.min(frameW - 1, this.cx));
-      this.cy = Math.max(0, Math.min(frameH - 1, this.cy));
+      const sub = subpixelOffset(rRe, this.w, this.h, px, py);
+      const scaleX = this.winW / this.w;
+      const scaleY = this.winH / this.h;
+      let dx = (px + sub.dx - (this.w - 1) / 2) * scaleX;
+      let dy = (py + sub.dy - (this.h - 1) / 2) * scaleY;
+      const jump = Math.hypot(dx, dy);
+      const limit = 0.4 * Math.hypot(this.winW, this.winH);
+      if (jump > limit && jump > 0) {
+        dx *= limit / jump;
+        dy *= limit / jump;
+      }
 
-      const { re, im } = this._filterFromPatch(gray, frameW, frameH);
-      this._accumulate(re, im, LEARNING);
+      this.cx = Math.max(0, Math.min(frameW - 1, this.cx + dx));
+      this.cy = Math.max(0, Math.min(frameH - 1, this.cy + dy));
+      this.outX = this.smoothX.filter(this.cx);
+      this.outY = this.smoothY.filter(this.cy);
 
-      const x = Math.round(this.cx - this.boxW / 2);
-      const y = Math.round(this.cy - this.boxH / 2);
-      const box = clampBbox([x, y, this.boxW, this.boxH], frameW, frameH);
-      return { ok: true, box };
+      const rate = LEARNING * Math.max(0.2, Math.min(1, (psr - PSR_MIN) / 8));
+      const sample = this._filterFromPatch(gray, frameW, frameH);
+      this._accumulate(sample.re, sample.im, rate);
+
+      const box = this._box();
+      return { ok: true, box, cx: this.outX, cy: this.outY };
     }
   }
 
@@ -355,8 +455,7 @@ const MocapTrack = (() => {
     const {
       bbox,
       startTime = 0,
-      nativeFps = 30,
-      timestampFps = nativeFps,
+      fps: fpsOption = 30,
       maxSide = TRACK_MAX_SIDE,
       shouldStop = () => false,
       onProgress = null,
@@ -370,8 +469,7 @@ const MocapTrack = (() => {
     canvas.height = size.height;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
-    const fps = Number(nativeFps) > 0 ? Number(nativeFps) : 30;
-    const stampFps = Number(timestampFps) >= 1 ? Number(timestampFps) : fps;
+    const fps = Number(fpsOption) > 0 ? Number(fpsOption) : 30;
     const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
     let startFrame = Math.round(Math.max(0, startTime) * fps);
     if (duration > 0) {
@@ -389,7 +487,7 @@ const MocapTrack = (() => {
       size.height,
     );
     const tracker = new MosseTracker();
-    if (!tracker.init(frame, trackBbox)) {
+    if (!tracker.init(frame, trackBbox, fps)) {
       throw new Error("Tracker failed to initialize on the selected box.");
     }
 
@@ -399,8 +497,7 @@ const MocapTrack = (() => {
     const boxes = [];
     let lostTarget = false;
 
-    const record = (box, timeSec) => {
-      const [cx, cy] = boxCenter(box);
+    const record = (box, timeSec, cx, cy) => {
       times.push(Number(timeSec));
       centerX.push(cx);
       centerY.push(cy);
@@ -416,12 +513,12 @@ const MocapTrack = (() => {
       width: size.width,
       height: size.height,
       lost: lostTarget ? 1 : 0,
-      fps: stampFps,
-      native_fps: fps,
+      fps,
       start_frame: startFrame,
     });
 
-    record(trackBbox, 0);
+    const [startCx, startCy] = boxCenter(trackBbox);
+    record(trackBbox, 0, startCx, startCy);
     const framesTotal = duration > 0 ? Math.max(Math.round(duration * fps) - startFrame, 1) : 0;
     let framesDone = 1;
     if (onProgress) onProgress(preview(), framesDone, framesTotal || framesDone);
@@ -440,24 +537,21 @@ const MocapTrack = (() => {
       ctx.drawImage(video, 0, 0, size.width, size.height);
       frame = ctx.getImageData(0, 0, size.width, size.height);
       framesDone += 1;
-      const { ok, box } = tracker.update(frame);
+      const { ok, box, cx, cy } = tracker.update(frame);
       if (!ok || box[2] <= 0 || box[3] <= 0) {
         lostTarget = true;
         break;
       }
       sampleIndex += 1;
-      record(box, sampleIndex / stampFps);
-      if (onProgress && (framesDone % 8 === 0 || (framesTotal && framesDone >= framesTotal))) {
-        onProgress(preview(), framesDone, framesTotal || framesDone);
-      }
+      record(box, sampleIndex / fps, cx, cy);
+      if (onProgress) onProgress(preview(), framesDone, framesTotal || framesDone);
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
 
     if (onProgress) onProgress(preview(), framesDone, framesDone);
 
     return {
-      fps: stampFps,
-      native_fps: fps,
+      fps,
       width: size.width,
       height: size.height,
       start_frame: startFrame,

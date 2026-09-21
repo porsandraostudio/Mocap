@@ -1,9 +1,11 @@
 # Media
 *.mp4
 *.mov
-
-# Python
-__pycache__/
+*.webm
 
 # Binaries
 *.exe
+
+# OS
+.DS_Store
+Thumbs.db

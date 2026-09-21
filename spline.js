@@ -1,9 +1,8 @@
 /**
- * Being-compatible cubic BPoly fit / sample / Curve JSON (browser port of spline_fit.py).
+ * Being-compatible cubic BPoly fit / sample / Curve JSON.
  *
- * Interpolating path: SciPy CubicSpline not-a-knot → PPoly power basis → BPoly Bernstein.
- * Smoothing > 0 pre-blurs samples, then fits the same interpolating spline
- * (FITPACK splrep is not available in the browser).
+ * Interpolating path: CubicSpline not-a-knot → PPoly power basis → BPoly Bernstein.
+ * Smoothing > 0 drops knots (Visvalingam–Whyatt), then interpolates the rest.
  */
 "use strict";
 
@@ -46,21 +45,91 @@ const MocapSpline = (() => {
     return { x, y };
   }
 
-  /** Mild zero-phase blur so the interpolating spline can follow a smoothing slider. */
-  function preSmooth(y, smoothing) {
-    if (!(smoothing > 0) || y.length < 3) return y.slice();
-    const out = y.slice();
-    const n = out.length;
-    const passes = Math.min(24, Math.max(1, Math.round(smoothing * n * 400)));
-    for (let p = 0; p < passes; p += 1) {
-      let prev = out[0];
-      for (let i = 1; i < n - 1; i += 1) {
-        const cur = out[i];
-        out[i] = 0.25 * prev + 0.5 * cur + 0.25 * out[i + 1];
-        prev = cur;
-      }
+  function triangleArea(ax, ay, bx, by, cx, cy) {
+    return Math.abs(ax * (by - cy) + bx * (cy - ay) + cx * (ay - by)) / 2;
+  }
+
+  /** Keep endpoints and the strongest corners (Visvalingam–Whyatt). */
+  function thinToCount(x, y, keep) {
+    const n = x.length;
+    keep = Math.max(4, Math.min(n, Math.round(keep)));
+    if (keep >= n) return { x: x.slice(), y: y.slice() };
+
+    const t0 = x[0];
+    const tSpan = (x[n - 1] - t0) || 1;
+    let yMin = y[0];
+    let yMax = y[0];
+    for (let i = 1; i < n; i += 1) {
+      if (y[i] < yMin) yMin = y[i];
+      if (y[i] > yMax) yMax = y[i];
     }
-    return out;
+    const ySpan = (yMax - yMin) || 1;
+    const tx = x.map((t) => (t - t0) / tSpan);
+    const ty = y.map((v) => (v - yMin) / ySpan);
+    const prev = new Int32Array(n);
+    const next = new Int32Array(n);
+    const alive = new Uint8Array(n);
+    const area = new Float64Array(n);
+    for (let i = 0; i < n; i += 1) {
+      prev[i] = i - 1;
+      next[i] = i + 1;
+      alive[i] = 1;
+    }
+    next[n - 1] = -1;
+
+    function updateArea(i) {
+      if (i <= 0 || i >= n - 1 || !alive[i]) {
+        area[i] = Infinity;
+        return;
+      }
+      const p = prev[i];
+      const q = next[i];
+      if (p < 0 || q < 0) {
+        area[i] = Infinity;
+        return;
+      }
+      area[i] = triangleArea(tx[p], ty[p], tx[i], ty[i], tx[q], ty[q]);
+    }
+
+    for (let i = 0; i < n; i += 1) updateArea(i);
+
+    let remaining = n;
+    while (remaining > keep) {
+      let best = -1;
+      let bestA = Infinity;
+      for (let i = 1; i < n - 1; i += 1) {
+        if (alive[i] && area[i] < bestA) {
+          bestA = area[i];
+          best = i;
+        }
+      }
+      if (best < 0) break;
+      alive[best] = 0;
+      remaining -= 1;
+      const p = prev[best];
+      const q = next[best];
+      if (p >= 0) next[p] = q;
+      if (q >= 0) prev[q] = p;
+      if (p >= 0) updateArea(p);
+      if (q >= 0) updateArea(q);
+    }
+
+    const ox = [];
+    const oy = [];
+    for (let i = 0; i < n; i += 1) {
+      if (!alive[i]) continue;
+      ox.push(x[i]);
+      oy.push(y[i]);
+    }
+    return { x: ox, y: oy };
+  }
+
+  /** Slider 0 → every sample; 500 (s = 5e-5) → 4 knots. */
+  function knotBudget(n, smoothing) {
+    if (!(smoothing > 0) || n <= 4) return n;
+    const t = Math.min(1, smoothing / 5e-5);
+    const minK = 4;
+    return Math.max(minK, Math.round(minK + (n - minK) * ((1 - t) ** 1.6)));
   }
 
   function solveTridiagonal(lower, diag, upper, rhs) {
@@ -227,11 +296,12 @@ const MocapSpline = (() => {
     if (unique.x.length < 4) {
       throw new Error("Need at least 4 unique timestamps to fit a cubic spline.");
     }
-    const y = preSmooth(unique.y, smoothing);
-    const slopes = notAKnotSlopes(unique.x, y);
-    const pp = hermitePowerCoeffs(unique.x, y, slopes);
-    const coefficients = fromPowerBasis(pp, unique.x);
-    return { knots: unique.x, coefficients };
+    const keep = knotBudget(unique.x.length, smoothing);
+    const pts = thinToCount(unique.x, unique.y, keep);
+    const slopes = notAKnotSlopes(pts.x, pts.y);
+    const pp = hermitePowerCoeffs(pts.x, pts.y, slopes);
+    const coefficients = fromPowerBasis(pp, pts.x);
+    return { knots: pts.x, coefficients };
   }
 
   function splineAxisNames(count) {
