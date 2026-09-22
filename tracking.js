@@ -1,14 +1,15 @@
 /**
- * In-browser MOSSE box tracker (Bolme 2010) on 640-capped grayscale frames.
- * Stops when peak-to-sidelobe ratio says the target is lost.
+ * In-browser MOSSE box tracker (Bolme 2010) on 1080-capped grayscale frames.
+ * Weak PSR frames keep the last box and tracking continues to the end of the clip.
  */
 "use strict";
 
 const MocapTrack = (() => {
-  const TRACK_MAX_SIDE = 640;
+  const TRACK_MAX_SIDE = 1080;
   const FILTER = 64;
   const LEARNING = 0.08;
   const PSR_MIN = 5.0;
+  const PSR_LEARN = 6.5;
   const WINDOW_PAD = 2;
   const INIT_SAMPLES = 8;
   const EPS = 1e-5;
@@ -248,11 +249,120 @@ const MocapTrack = (() => {
     return patch;
   }
 
-  function rgbaToGray(imageData) {
+  function pixelLum(r, g, b) {
+    return 0.299 * r + 0.587 * g + 0.114 * b;
+  }
+
+  function sampleAppearance(imageData, bbox) {
+    const { data, width, height } = imageData;
+    const [bx, by, bw, bh] = clampBbox(bbox, width, height);
+    const x0 = Math.floor(bx + bw * 0.2);
+    const y0 = Math.floor(by + bh * 0.2);
+    const x1 = Math.max(x0 + 1, Math.floor(bx + bw * 0.8));
+    const y1 = Math.max(y0 + 1, Math.floor(by + bh * 0.8));
+    let boxLum = 0;
+    let n = 0;
+    for (let y = y0; y < y1; y += 1) {
+      for (let x = x0; x < x1; x += 1) {
+        const i = (y * width + x) * 4;
+        boxLum += pixelLum(data[i], data[i + 1], data[i + 2]);
+        n += 1;
+      }
+    }
+    boxLum = n ? boxLum / n : 0;
+    const pad = Math.max(6, Math.round(Math.max(bw, bh)));
+    const rx0 = Math.max(0, Math.floor(bx - pad));
+    const ry0 = Math.max(0, Math.floor(by - pad));
+    const rx1 = Math.min(width, Math.ceil(bx + bw + pad));
+    const ry1 = Math.min(height, Math.ceil(by + bh + pad));
+    let ringLum = 0;
+    let rn = 0;
+    for (let y = ry0; y < ry1; y += 1) {
+      for (let x = rx0; x < rx1; x += 1) {
+        if (x >= bx && x < bx + bw && y >= by && y < by + bh) continue;
+        const i = (y * width + x) * 4;
+        ringLum += pixelLum(data[i], data[i + 1], data[i + 2]);
+        rn += 1;
+      }
+    }
+    ringLum = rn ? ringLum / rn : boxLum;
+    const polarity = boxLum < ringLum - 12 ? "dark" : boxLum > ringLum + 12 ? "bright" : "none";
+    return { boxLum, ringLum, mid: (boxLum + ringLum) / 2, polarity };
+  }
+
+  function appearanceScore(lum, model) {
+    if (!model || model.polarity === "none") return 0;
+    if (model.polarity === "dark") {
+      const cut = model.ringLum - 6;
+      if (lum > cut) return 0;
+      return (cut - lum) / Math.max(8, cut - model.boxLum);
+    }
+    const cut = model.ringLum + 6;
+    if (lum < cut) return 0;
+    return (lum - cut) / Math.max(8, model.boxLum - cut);
+  }
+
+  function appearanceCentroid(imageData, cx, cy, searchW, searchH, model) {
+    if (!model || model.polarity === "none") return null;
+    const { data, width, height } = imageData;
+    const x0 = Math.max(0, Math.floor(cx - searchW / 2));
+    const y0 = Math.max(0, Math.floor(cy - searchH / 2));
+    const x1 = Math.min(width, Math.ceil(cx + searchW / 2));
+    const y1 = Math.min(height, Math.ceil(cy + searchH / 2));
+    let sx = 0;
+    let sy = 0;
+    let wsum = 0;
+    for (let y = y0; y < y1; y += 1) {
+      for (let x = x0; x < x1; x += 1) {
+        const i = (y * width + x) * 4;
+        const w = appearanceScore(pixelLum(data[i], data[i + 1], data[i + 2]), model);
+        if (w <= 0) continue;
+        sx += x * w;
+        sy += y * w;
+        wsum += w;
+      }
+    }
+    if (wsum < 4) return null;
+    return { x: sx / wsum + 0.5, y: sy / wsum + 0.5, weight: wsum };
+  }
+
+  /** Find the strongest marker-like pixel, then take a local centroid around it. */
+  function appearancePeakCentroid(imageData, model, boxW, boxH) {
+    if (!model || model.polarity === "none") return null;
+    const { data, width, height } = imageData;
+    let best = 0;
+    let px = 0;
+    let py = 0;
+    for (let y = 0; y < height; y += 2) {
+      for (let x = 0; x < width; x += 2) {
+        const i = (y * width + x) * 4;
+        const w = appearanceScore(pixelLum(data[i], data[i + 1], data[i + 2]), model);
+        if (w > best) {
+          best = w;
+          px = x;
+          py = y;
+        }
+      }
+    }
+    if (best <= 0) return null;
+    return appearanceCentroid(
+      imageData, px, py,
+      Math.max(16, boxW * 3), Math.max(16, boxH * 3),
+      model,
+    );
+  }
+
+  function rgbaToGray(imageData, model) {
     const { width, height, data } = imageData;
     const gray = new Float64Array(width * height);
+    if (model && model.polarity !== "none") {
+      for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+        gray[p] = 255 * appearanceScore(pixelLum(data[i], data[i + 1], data[i + 2]), model);
+      }
+      return gray;
+    }
     for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
-      gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      gray[p] = pixelLum(data[i], data[i + 1], data[i + 2]);
     }
     return gray;
   }
@@ -281,6 +391,10 @@ const MocapTrack = (() => {
       this.winH = FILTER;
       this.smoothX = null;
       this.smoothY = null;
+      this.appearance = null;
+      this.initWeight = 0;
+      this.vx = 0;
+      this.vy = 0;
     }
 
     _accumulate(fRe, fIm, rate) {
@@ -321,9 +435,14 @@ const MocapTrack = (() => {
       const frameH = imageData.height;
       this.frameW = frameW;
       this.frameH = frameH;
-      const gray = rgbaToGray(imageData);
       const box = clampBbox(bbox, frameW, frameH);
+      this.appearance = sampleAppearance(imageData, box);
+      const gray = rgbaToGray(imageData, this.appearance);
+      this.vx = 0;
+      this.vy = 0;
       const [cx, cy] = boxCenter(box);
+      const seed = appearanceCentroid(imageData, cx, cy, box[2] * 2, box[3] * 2, this.appearance);
+      this.initWeight = seed ? seed.weight : 0;
       this.cx = cx;
       this.cy = cy;
       this.outX = cx;
@@ -360,7 +479,7 @@ const MocapTrack = (() => {
       const frameH = imageData.height;
       this.frameW = frameW;
       this.frameH = frameH;
-      const gray = rgbaToGray(imageData);
+      const gray = rgbaToGray(imageData, this.appearance);
       const { re: fRe, im: fIm } = this._filterFromPatch(gray, frameW, frameH);
       const n = this.w * this.h;
       const rRe = new Float64Array(n);
@@ -403,28 +522,74 @@ const MocapTrack = (() => {
       const mean = count ? sum / count : 0;
       const std = count ? Math.sqrt(Math.max(0, sum2 / count - mean * mean)) + EPS : 1;
       const psr = (peak - mean) / std;
-      if (psr < PSR_MIN) return { ok: false, box: [0, 0, 0, 0] };
-
       const sub = subpixelOffset(rRe, this.w, this.h, px, py);
       const scaleX = this.winW / this.w;
       const scaleY = this.winH / this.h;
       let dx = (px + sub.dx - (this.w - 1) / 2) * scaleX;
       let dy = (py + sub.dy - (this.h - 1) / 2) * scaleY;
       const jump = Math.hypot(dx, dy);
-      const limit = 0.4 * Math.hypot(this.winW, this.winH);
+      const limit = 0.35 * Math.hypot(this.winW, this.winH);
       if (jump > limit && jump > 0) {
         dx *= limit / jump;
         dy *= limit / jump;
       }
+      const mosseX = this.cx + dx;
+      const mosseY = this.cy + dy;
+      const mosseOk = psr >= PSR_MIN;
 
-      this.cx = Math.max(0, Math.min(frameW - 1, this.cx + dx));
-      this.cy = Math.max(0, Math.min(frameH - 1, this.cy + dy));
-      this.outX = this.smoothX.filter(this.cx);
-      this.outY = this.smoothY.filter(this.cy);
+      const predX = this.cx + this.vx;
+      const predY = this.cy + this.vy;
+      let blob = appearanceCentroid(imageData, predX, predY, this.winW * 2.2, this.winH * 2.2, this.appearance);
+      if (!blob) {
+        blob = appearanceCentroid(imageData, predX, predY, this.winW * 5, this.winH * 5, this.appearance);
+      }
+      if (!blob) {
+        blob = appearanceCentroid(imageData, predX, predY, this.winW * 10, this.winH * 10, this.appearance);
+      }
+      const weak = !blob || (this.initWeight > 0 && blob.weight < this.initWeight * 0.28);
+      if (weak) {
+        const global = appearancePeakCentroid(imageData, this.appearance, this.boxW, this.boxH);
+        if (global && (!blob || global.weight > blob.weight * 1.15)) blob = global;
+      }
 
-      const rate = LEARNING * Math.max(0.2, Math.min(1, (psr - PSR_MIN) / 8));
-      const sample = this._filterFromPatch(gray, frameW, frameH);
-      this._accumulate(sample.re, sample.im, rate);
+      let nx = this.cx;
+      let ny = this.cy;
+      let ok = false;
+      let fromBlob = false;
+      if (blob) {
+        nx = blob.x;
+        ny = blob.y;
+        ok = true;
+        fromBlob = true;
+      } else if (mosseOk && (!this.appearance || this.appearance.polarity === "none")) {
+        nx = mosseX;
+        ny = mosseY;
+        ok = true;
+      }
+
+      if (!ok) return { ok: false, box: this._box(), cx: this.outX, cy: this.outY };
+
+      const prevX = this.cx;
+      const prevY = this.cy;
+      this.cx = Math.max(0, Math.min(frameW - 1, nx));
+      this.cy = Math.max(0, Math.min(frameH - 1, ny));
+      this.vx = this.cx - prevX;
+      this.vy = this.cy - prevY;
+      if (fromBlob) {
+        this.outX = this.cx;
+        this.outY = this.cy;
+        this.smoothX.filter(this.cx);
+        this.smoothY.filter(this.cy);
+      } else {
+        this.outX = this.smoothX.filter(this.cx);
+        this.outY = this.smoothY.filter(this.cy);
+      }
+
+      if (psr >= PSR_LEARN) {
+        const rate = LEARNING * Math.min(1, (psr - PSR_LEARN) / 6 + 0.25);
+        const sample = this._filterFromPatch(gray, frameW, frameH);
+        this._accumulate(sample.re, sample.im, rate);
+      }
 
       const box = this._box();
       return { ok: true, box, cx: this.outX, cy: this.outY };
@@ -495,7 +660,7 @@ const MocapTrack = (() => {
     const centerX = [];
     const centerY = [];
     const boxes = [];
-    let lostTarget = false;
+    let lostCount = 0;
 
     const record = (box, timeSec, cx, cy) => {
       times.push(Number(timeSec));
@@ -512,7 +677,7 @@ const MocapTrack = (() => {
       n: times.length,
       width: size.width,
       height: size.height,
-      lost: lostTarget ? 1 : 0,
+      lost: lostCount,
       fps,
       start_frame: startFrame,
     });
@@ -538,12 +703,19 @@ const MocapTrack = (() => {
       frame = ctx.getImageData(0, 0, size.width, size.height);
       framesDone += 1;
       const { ok, box, cx, cy } = tracker.update(frame);
-      if (!ok || box[2] <= 0 || box[3] <= 0) {
-        lostTarget = true;
-        break;
-      }
       sampleIndex += 1;
-      record(box, sampleIndex / fps, cx, cy);
+      if (!ok || box[2] <= 0 || box[3] <= 0) {
+        lostCount += 1;
+        const lastBox = boxes[boxes.length - 1] || trackBbox;
+        record(
+          lastBox,
+          sampleIndex / fps,
+          centerX[centerX.length - 1],
+          centerY[centerY.length - 1],
+        );
+      } else {
+        record(box, sampleIndex / fps, cx, cy);
+      }
       if (onProgress) onProgress(preview(), framesDone, framesTotal || framesDone);
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
@@ -559,7 +731,7 @@ const MocapTrack = (() => {
       x: centerX,
       y: centerY,
       bboxes: boxes,
-      lost: lostTarget ? 1 : 0,
+      lost: lostCount,
     };
   }
 
