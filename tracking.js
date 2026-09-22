@@ -1,11 +1,11 @@
 /**
- * In-browser MOSSE box tracker (Bolme 2010) on 1080-capped grayscale frames.
+ * In-browser MOSSE box tracker (Bolme 2010) on 640-capped grayscale frames.
  * Weak PSR frames keep the last box and tracking continues to the end of the clip.
  */
 "use strict";
 
 const MocapTrack = (() => {
-  const TRACK_MAX_SIDE = 1080;
+  const TRACK_MAX_SIDE = 640;
   const FILTER = 64;
   const LEARNING = 0.08;
   const PSR_MIN = 5.0;
@@ -293,13 +293,11 @@ const MocapTrack = (() => {
   function appearanceScore(lum, model) {
     if (!model || model.polarity === "none") return 0;
     if (model.polarity === "dark") {
-      const cut = model.ringLum - 6;
-      if (lum > cut) return 0;
-      return (cut - lum) / Math.max(8, cut - model.boxLum);
+      if (lum > model.mid) return 0;
+      return (model.mid - lum) / Math.max(8, model.mid - model.boxLum);
     }
-    const cut = model.ringLum + 6;
-    if (lum < cut) return 0;
-    return (lum - cut) / Math.max(8, model.boxLum - cut);
+    if (lum < model.mid) return 0;
+    return (lum - model.mid) / Math.max(8, model.boxLum - model.mid);
   }
 
   function appearanceCentroid(imageData, cx, cy, searchW, searchH, model) {
@@ -324,32 +322,6 @@ const MocapTrack = (() => {
     }
     if (wsum < 4) return null;
     return { x: sx / wsum + 0.5, y: sy / wsum + 0.5, weight: wsum };
-  }
-
-  /** Find the strongest marker-like pixel, then take a local centroid around it. */
-  function appearancePeakCentroid(imageData, model, boxW, boxH) {
-    if (!model || model.polarity === "none") return null;
-    const { data, width, height } = imageData;
-    let best = 0;
-    let px = 0;
-    let py = 0;
-    for (let y = 0; y < height; y += 2) {
-      for (let x = 0; x < width; x += 2) {
-        const i = (y * width + x) * 4;
-        const w = appearanceScore(pixelLum(data[i], data[i + 1], data[i + 2]), model);
-        if (w > best) {
-          best = w;
-          px = x;
-          py = y;
-        }
-      }
-    }
-    if (best <= 0) return null;
-    return appearanceCentroid(
-      imageData, px, py,
-      Math.max(16, boxW * 3), Math.max(16, boxH * 3),
-      model,
-    );
   }
 
   function rgbaToGray(imageData, model) {
@@ -392,7 +364,6 @@ const MocapTrack = (() => {
       this.smoothX = null;
       this.smoothY = null;
       this.appearance = null;
-      this.initWeight = 0;
       this.vx = 0;
       this.vy = 0;
     }
@@ -441,8 +412,6 @@ const MocapTrack = (() => {
       this.vx = 0;
       this.vy = 0;
       const [cx, cy] = boxCenter(box);
-      const seed = appearanceCentroid(imageData, cx, cy, box[2] * 2, box[3] * 2, this.appearance);
-      this.initWeight = seed ? seed.weight : 0;
       this.cx = cx;
       this.cy = cy;
       this.outX = cx;
@@ -545,11 +514,6 @@ const MocapTrack = (() => {
       }
       if (!blob) {
         blob = appearanceCentroid(imageData, predX, predY, this.winW * 10, this.winH * 10, this.appearance);
-      }
-      const weak = !blob || (this.initWeight > 0 && blob.weight < this.initWeight * 0.28);
-      if (weak) {
-        const global = appearancePeakCentroid(imageData, this.appearance, this.boxW, this.boxH);
-        if (global && (!blob || global.weight > blob.weight * 1.15)) blob = global;
       }
 
       let nx = this.cx;
