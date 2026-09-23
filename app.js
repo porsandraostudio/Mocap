@@ -140,6 +140,12 @@ function isWebmBlob(file) {
   return /\.webm$/i.test(file.name || "");
 }
 
+function isMp4Like(file) {
+  if (!file) return false;
+  if (file.type && /(mp4|quicktime|m4v)/i.test(file.type)) return true;
+  return /\.(mp4|m4v|mov)$/i.test(file.name || "");
+}
+
 function readEbmlId(view, offset) {
   const first = view.getUint8(offset);
   let width = 1;
@@ -248,6 +254,173 @@ async function webmDurationSeconds(file) {
   }
 }
 
+function readFourCC(view, offset) {
+  if (offset + 4 > view.byteLength) return "";
+  return String.fromCharCode(
+    view.getUint8(offset),
+    view.getUint8(offset + 1),
+    view.getUint8(offset + 2),
+    view.getUint8(offset + 3),
+  );
+}
+
+function walkIsoBoxes(view, start, end, onBox) {
+  let offset = start;
+  while (offset + 8 <= end) {
+    let size = view.getUint32(offset);
+    const type = readFourCC(view, offset + 4);
+    let header = 8;
+    if (size === 1) {
+      if (offset + 16 > end) break;
+      size = Number(view.getBigUint64(offset + 8));
+      header = 16;
+    } else if (size === 0) {
+      size = end - offset;
+    }
+    if (!Number.isFinite(size) || size < header) break;
+    const boxEnd = Math.min(end, offset + size);
+    const payload = offset + header;
+    const enter = onBox(type, payload, boxEnd);
+    if (enter) walkIsoBoxes(view, payload, boxEnd, onBox);
+    if (size === 0) break;
+    offset = boxEnd;
+  }
+}
+
+function findIsoBoxOffset(view, type) {
+  for (let i = 4; i + 4 <= view.byteLength; i += 1) {
+    if (readFourCC(view, i) === type) return Math.max(0, i - 4);
+  }
+  return -1;
+}
+
+function parseMp4Timing(buffer) {
+  const view = new DataView(buffer);
+  const tracks = [];
+
+  const readTrack = (payload, boxEnd) => {
+    const track = { vide: false, timescale: 0, duration: 0, samples: 0, delta: 0, codec: "" };
+    walkIsoBoxes(view, payload, boxEnd, (type, p, end) => {
+      if (type === "mdia" || type === "minf" || type === "stbl") return true;
+      if (type === "hdlr" && p + 12 <= end) {
+        if (readFourCC(view, p + 8) === "vide") track.vide = true;
+      } else if (type === "mdhd" && p + 4 <= end) {
+        const version = view.getUint8(p);
+        if (version === 1 && p + 32 <= end) {
+          track.timescale = view.getUint32(p + 20);
+          const dur = Number(view.getBigUint64(p + 24));
+          if (dur > 0) track.duration = dur;
+        } else if (p + 20 <= end) {
+          track.timescale = view.getUint32(p + 12);
+          const dur = view.getUint32(p + 16);
+          if (dur > 0) track.duration = dur;
+        }
+      } else if (type === "stts" && p + 8 <= end) {
+        const count = view.getUint32(p + 4);
+        let samples = 0;
+        let weighted = 0;
+        let firstDelta = 0;
+        for (let i = 0; i < count; i += 1) {
+          const off = p + 8 + i * 8;
+          if (off + 8 > end) break;
+          const n = view.getUint32(off);
+          const delta = view.getUint32(off + 4);
+          samples += n;
+          weighted += n * delta;
+          if (!firstDelta && delta) firstDelta = delta;
+        }
+        track.samples = samples;
+        track.delta = samples ? weighted / samples : firstDelta;
+      } else if (type === "stsd" && p + 16 <= end) {
+        track.codec = readFourCC(view, p + 12);
+      }
+      return false;
+    });
+    return track;
+  };
+
+  const scan = (start) => {
+    walkIsoBoxes(view, start, view.byteLength, (type, payload, boxEnd) => {
+      if (type === "moov") return true;
+      if (type === "trak") {
+        tracks.push(readTrack(payload, boxEnd));
+        return false;
+      }
+      return false;
+    });
+  };
+  scan(0);
+  if (!tracks.length) {
+    const moovAt = findIsoBoxOffset(view, "moov");
+    if (moovAt >= 0) scan(moovAt);
+  }
+
+  const videoTrack = tracks.find((t) => t.vide && t.timescale > 0) || tracks.find((t) => t.timescale > 0);
+  if (!videoTrack) return { fps: 0, duration: 0, codec: "" };
+  let fps = 0;
+  if (videoTrack.duration > 0 && videoTrack.samples > 1) {
+    fps = (videoTrack.samples * videoTrack.timescale) / videoTrack.duration;
+  } else if (videoTrack.delta > 0 && videoTrack.timescale > 0) {
+    fps = videoTrack.timescale / videoTrack.delta;
+  }
+  const duration = videoTrack.timescale > 0 && videoTrack.duration > 0
+    ? videoTrack.duration / videoTrack.timescale
+    : 0;
+  if (!(fps >= 1 && fps <= 240)) fps = 0;
+  return { fps, duration, codec: videoTrack.codec || "" };
+}
+
+function parseWebmTimingInfo(buffer) {
+  const duration = readWebmTiming(buffer);
+  const view = new DataView(buffer);
+  const end = view.byteLength;
+  let defaultDuration = 0;
+  let offset = 0;
+  while (offset + 2 < end) {
+    let id;
+    let size;
+    try {
+      id = readEbmlId(view, offset);
+      size = readEbmlSize(view, offset + id.width);
+    } catch (_) {
+      break;
+    }
+    const payload = offset + id.width + size.width;
+    if (id.id === 0x23e383 && !size.unknown && size.value > 0 && payload + size.value <= end) {
+      defaultDuration = readEbmlUint(view, payload, size.value);
+    }
+    const enter = id.id === 0x18538067 || id.id === 0x1549a966 || id.id === 0x1f43b675
+      || id.id === 0x1654ae6b || id.id === 0xae
+      || id.id === 0xa0 || id.id === 0x1c53bb6b || id.id === 0xbb || size.unknown;
+    offset = enter ? payload : payload + size.value;
+  }
+  let fps = 0;
+  if (defaultDuration > 0) fps = 1e9 / defaultDuration;
+  if (!(fps >= 1 && fps <= 240)) fps = 0;
+  return { fps, duration, codec: "vp8" };
+}
+
+async function detectMediaTiming(file) {
+  const empty = { fps: 0, duration: 0, codec: "" };
+  if (!file) return empty;
+  try {
+    const chunk = 8 * 1024 * 1024;
+    const head = await file.slice(0, Math.min(file.size, chunk)).arrayBuffer();
+    const tryParse = (buffer) => {
+      if (isWebmBlob(file)) return parseWebmTimingInfo(buffer);
+      return parseMp4Timing(buffer);
+    };
+    let timing = tryParse(head);
+    if (timing.fps > 0 || timing.duration > 0) return timing;
+    if (file.size > chunk) {
+      const tail = await file.slice(Math.max(0, file.size - chunk)).arrayBuffer();
+      timing = tryParse(tail);
+      if (timing.fps > 0 || timing.duration > 0) return timing;
+    }
+  } catch (_) { /* fall through */ }
+  return empty;
+}
+
 function writeEbmlSize(value, width) {
   const bytes = new Uint8Array(width);
   let n = value;
@@ -345,7 +518,7 @@ function clipDuration() {
   return mediaDuration();
 }
 
-/** FPS field: tracking sample rate and curve timestamps. */
+/** FPS field: tracking sample rate. Timestamps come from the media clock. */
 function clipFps() {
   const value = Number(byId("fps")?.value);
   if (Number.isFinite(value) && value >= 1 && value <= 240) return value;
@@ -360,15 +533,6 @@ function formatFps(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return "30";
   return n.toFixed(2).replace(/\.?0+$/, "") || "30";
-}
-
-/** Rebuild track sample times as t = i / clipFps from the selection frame. */
-function rebuildTrackTimestamps() {
-  if (!state.track?.times?.length) return;
-  const fps = clipFps();
-  const times = state.track.times;
-  for (let i = 0; i < times.length; i += 1) times[i] = i / fps;
-  state.track.fps = fps;
 }
 
 // ---------------------------------------------------------------------------
@@ -856,20 +1020,27 @@ function attachLocalFile(file, extras = {}) {
       return;
     }
     const size = MocapTrack.trackFrameSize(vw, vh);
+    const timing = await detectMediaTiming(file);
     let duration = Number(extras.duration) || mediaDuration();
+    if (!(duration > 0) && timing.duration > 0) duration = timing.duration;
     if (!(duration > 0) && isWebmBlob(file)) {
       duration = await webmDurationSeconds(file);
     }
+    const fps = extras.fps || timing.fps || 30;
     attachVideo({
       name: file.name || "clip",
       width: vw,
       height: vh,
       track_width: size.width,
       track_height: size.height,
-      fps: extras.fps || 30,
+      fps,
       duration,
-      nframes: duration > 0 ? Math.round(duration * (extras.fps || 30)) : 0,
+      nframes: duration > 0 ? Math.round(duration * fps) : 0,
+      codec: timing.codec || "",
     }, url);
+    if (/^(hvc1|hev1|hvcC)$/i.test(timing.codec || "")) {
+      byId("sourceHint").textContent = "This clip is HEVC. If it will not play, re-export as H.264 MP4.";
+    }
   };
   video.addEventListener("loadedmetadata", onReady);
   video.removeAttribute("src");
@@ -892,6 +1063,8 @@ function attachVideo(meta, srcUrl) {
   state.isTracking = false;
   setBoxDrawing(false);
   clearFitResult();
+  byId("progressWrap").classList.add("hidden");
+  byId("fitHint").textContent = "Track or load JSON. Black dots are knots.";
   byId("invert").checked = true;
   if (byId("fps")) byId("fps").value = formatFps(meta.fps || 30);
   if (srcUrl && video.src !== srcUrl) {
@@ -1033,10 +1206,10 @@ function failTracking(message) {
 function finishTracking(result) {
   state.isTracking = false;
   state.track = result;
-  rebuildTrackTimestamps();
   clearFitResult();
   byId("progressWrap").classList.remove("hidden");
-  byId("progressText").textContent = `Tracked ${result.times.length} frames, lost ${result.lost}`;
+  const extra = result.stopped_early ? " (lost the marker)" : "";
+  byId("progressText").textContent = `Tracked ${result.times.length} frames, lost ${result.lost}${extra}`;
   const seeking = seekToTrackSample(state.track.start_frame, state.track.times.length);
   syncSeekBar();
   if (!seeking) drawOverlay();
@@ -1228,6 +1401,12 @@ video.addEventListener("durationchange", refreshClipMeta);
 video.addEventListener("progress", refreshClipMeta);
 
 byId("trackBtn").addEventListener("click", async () => {
+  if (state.isTracking) {
+    state.isTracking = false;
+    byId("trackBtn").textContent = "Track";
+    byId("progressText").textContent = "Stopping…";
+    return;
+  }
   if (!hasClip() || !state.bbox) {
     byId("sourceHint").textContent = "Load a clip and draw a box first.";
     return;
@@ -1260,6 +1439,7 @@ byId("trackBtn").addEventListener("click", async () => {
   video.pause();
   syncPlayButton();
   drawOverlay();
+  byId("trackBtn").textContent = "Stop";
   byId("progressWrap").classList.remove("hidden");
   byId("progressBar").style.width = "0%";
   byId("progressText").textContent = "Starting…";
@@ -1272,15 +1452,21 @@ byId("trackBtn").addEventListener("click", async () => {
       onProgress: (preview, done, total) => {
         const pct = Math.round((total ? done / total : 0) * 100);
         byId("progressBar").style.width = `${pct}%`;
-        byId("progressText").textContent = `Tracking ${pct}%`;
+        const lost = preview.lost ? ` · lost ${preview.lost}` : "";
+        byId("progressText").textContent = `Tracking ${pct}%${lost}`;
         applyTrackPreview(preview);
         drawOverlay();
       },
     });
-    if (!state.isTracking) return;
-    finishTracking(result);
+    if (result?.times?.length >= 4) {
+      finishTracking(result);
+    } else {
+      failTracking(state.isTracking ? "Tracking failed" : "Stopped");
+    }
   } catch (err) {
     failTracking(err.message || "Tracking failed");
+  } finally {
+    byId("trackBtn").textContent = "Track";
   }
 });
 
@@ -1309,16 +1495,7 @@ byId("smoothing").addEventListener("input", () => {
 
 byId("fps").addEventListener("input", () => {
   if (state.videoMeta) refreshClipMeta();
-  if (state.hasLoadedCurve || !state.track) {
-    drawPlot();
-    return;
-  }
-  rebuildTrackTimestamps();
-  state.scaledSeries = null;
-  clearFitResult();
-  drawOverlay();
   drawPlot();
-  scheduleSplineFit();
 });
 
 byId("csvBtn").addEventListener("click", () => {
