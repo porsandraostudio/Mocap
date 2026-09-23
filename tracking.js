@@ -1,7 +1,7 @@
 /**
  * In-browser marker tracker: compact bright/dark blob first, MOSSE as fallback.
  * Frames are capped at 1024 on the long side. Lost frames are not frozen in place;
- * tracking stops after a short streak of misses.
+ * tracking stops after a recovery window of misses.
  */
 "use strict";
 
@@ -14,7 +14,7 @@ const MocapTrack = (() => {
   const WINDOW_PAD = 2.2;
   const INIT_SAMPLES = 8;
   const EPS = 1e-5;
-  const LOST_LIMIT = 18;
+  const LOST_LIMIT = 45;
   const AREA_MIN = 0.32;
   const AREA_MAX = 2.7;
   const RADIUS_MIN = 0.38;
@@ -710,11 +710,12 @@ const MocapTrack = (() => {
       const mosse = this._mosse(gray, frameW, frameH);
 
       const speed = Math.hypot(this.vx, this.vy);
-      const predX = this.cx + this.vx;
-      const predY = this.cy + this.vy;
+      const lead = 1 + Math.min(3, this.lostStreak * 0.35);
+      const predX = this.cx + this.vx * lead;
+      const predY = this.cy + this.vy * lead;
       const base = Math.max(this.winW, this.winH, (this.appearance?.radius || 8) * 4);
-      const expand = this.lostStreak > 0 ? 1.55 + Math.min(1.2, this.lostStreak * 0.12) : 1;
-      const search = Math.min(Math.max(frameW, frameH), base * expand + 3.5 * speed);
+      const expand = this.lostStreak > 0 ? 1.8 + Math.min(2.2, this.lostStreak * 0.2) : 1;
+      const search = Math.min(Math.max(frameW, frameH), base * expand + 4.5 * speed);
 
       let blob = markerBlob(imageData, predX, predY, search, search, this.appearance);
       if (blob && !blobFitsModel(blob, this.appearance)) blob = null;

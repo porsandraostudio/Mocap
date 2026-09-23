@@ -128,6 +128,30 @@ function exportBasename() {
   return name.replace(/\.[^.]+$/, "") || "mocap";
 }
 
+function exportAxes() {
+  return Object.keys(state.fitResult?.knot_values || {});
+}
+
+function downloadAxisExports(format) {
+  if (!state.fitResult) return;
+  const axes = exportAxes();
+  const extension = format === "csv" ? "csv" : "json";
+  const type = format === "csv" ? "text/csv" : "application/json";
+  if (axes.length <= 1) {
+    const content = format === "csv" ? state.fitResult.csv : state.fitResult.curve;
+    download(`${exportBasename()}.${extension}`, content, type);
+    return;
+  }
+
+  const curve = format === "json" ? JSON.parse(state.fitResult.curve) : null;
+  axes.forEach((axis, index) => {
+    const content = format === "csv"
+      ? formatCsv(state.fitResult.knot_times, { [axis]: state.fitResult.knot_values[axis] })
+      : JSON.stringify({ splines: [curve.splines[index]], type: "Curve" }, null, 4);
+    download(`${exportBasename()}-${axis}.${extension}`, content, type);
+  });
+}
+
 function mediaDuration() {
   const d = video.duration;
   if (Number.isFinite(d) && d > 0) return d;
@@ -1093,9 +1117,6 @@ function setBoxDrawing(on) {
   state.isDrawingBox = on;
   videoFrame.classList.toggle("drawing", on);
   byId("drawBtn").textContent = on ? "Drawing…" : "Draw box";
-  if (on) {
-    byId("sourceHint").textContent = "Keep the box tight on the marker only. Extra background lets the tracker lock onto edges instead.";
-  }
 }
 
 function refreshClipMeta() {
@@ -1499,13 +1520,11 @@ byId("fps").addEventListener("input", () => {
 });
 
 byId("csvBtn").addEventListener("click", () => {
-  if (!state.fitResult) return;
-  download(`${exportBasename()}.csv`, state.fitResult.csv, "text/csv");
+  downloadAxisExports("csv");
 });
 
 byId("jsonBtn").addEventListener("click", () => {
-  if (!state.fitResult) return;
-  download(`${exportBasename()}.json`, state.fitResult.curve, "application/json");
+  downloadAxisExports("json");
 });
 
 byId("fileInput").addEventListener("change", (event) => {
