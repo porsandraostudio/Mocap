@@ -5,7 +5,7 @@
 "use strict";
 
 const MocapTrack = (() => {
-  const TRACK_MAX_SIDE = 640;
+  const TRACK_MAX_SIDE = 1024;
   const FILTER = 64;
   const LEARNING = 0.08;
   const PSR_MIN = 5.0;

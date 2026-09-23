@@ -27,6 +27,7 @@ const state = {
   exportFileName: null,
   cameraStream: null,
   recorder: null,
+  cameraRecording: null,
   isLiveCamera: false,
   recordingClockTimer: null,
   recordingStartedAt: 0,
@@ -91,13 +92,22 @@ function syncPlayButton() {
 }
 
 function download(name, text, type) {
-  const blob = new Blob([text], { type });
+  downloadBlob(name, new Blob([text], { type }));
+}
+
+function downloadBlob(name, blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+function setCameraRecording(file) {
+  state.cameraRecording = file || null;
+  const btn = byId("downloadClipBtn");
+  if (btn) btn.disabled = !file;
 }
 
 function revokeObjectUrl() {
@@ -121,23 +131,218 @@ function exportBasename() {
 function mediaDuration() {
   const d = video.duration;
   if (Number.isFinite(d) && d > 0) return d;
-  if (video.seekable && video.seekable.length) {
-    const end = video.seekable.end(video.seekable.length - 1);
-    if (Number.isFinite(end) && end > 0) return end;
-  }
-  if (video.buffered && video.buffered.length) {
-    const end = video.buffered.end(video.buffered.length - 1);
-    if (Number.isFinite(end) && end > 0) return end;
-  }
   return 0;
 }
 
-/** Prefer the known clip length; never shrink it to a partial buffer range. */
+function isWebmBlob(file) {
+  if (!file) return false;
+  if (file.type && /webm/i.test(file.type)) return true;
+  return /\.webm$/i.test(file.name || "");
+}
+
+function readEbmlId(view, offset) {
+  const first = view.getUint8(offset);
+  let width = 1;
+  let mask = 0x80;
+  while (width < 4 && !(first & mask)) {
+    width += 1;
+    mask >>= 1;
+  }
+  if (!(first & mask)) throw new Error("bad id");
+  let id = 0;
+  for (let i = 0; i < width; i += 1) id = (id << 8) | view.getUint8(offset + i);
+  return { id, width };
+}
+
+function readEbmlSize(view, offset) {
+  const first = view.getUint8(offset);
+  let width = 1;
+  let mask = 0x80;
+  while (width < 8 && !(first & mask)) {
+    width += 1;
+    mask >>= 1;
+  }
+  if (!(first & mask)) throw new Error("bad size");
+  const dataMask = mask - 1;
+  let unknown = (first & dataMask) === dataMask;
+  let value = first & dataMask;
+  for (let i = 1; i < width; i += 1) {
+    const b = view.getUint8(offset + i);
+    if (b !== 0xff) unknown = false;
+    value = value * 256 + b;
+  }
+  return { value, width, unknown };
+}
+
+function readEbmlVint(view, offset) {
+  const first = view.getUint8(offset);
+  let width = 1;
+  let mask = 0x80;
+  while (width < 8 && !(first & mask)) {
+    width += 1;
+    mask >>= 1;
+  }
+  let value = first & (mask - 1);
+  for (let i = 1; i < width; i += 1) value = value * 256 + view.getUint8(offset + i);
+  return { value, width };
+}
+
+function readEbmlUint(view, offset, len) {
+  let n = 0;
+  for (let i = 0; i < len; i += 1) n = n * 256 + view.getUint8(offset + i);
+  return n;
+}
+
+function readWebmTiming(buffer) {
+  const view = new DataView(buffer);
+  const end = view.byteLength;
+  let scale = 1000000;
+  let duration = 0;
+  let clusterTs = 0;
+  let lastBlock = 0;
+  let prevBlock = 0;
+  let offset = 0;
+  while (offset + 2 < end) {
+    let id;
+    let size;
+    try {
+      id = readEbmlId(view, offset);
+      size = readEbmlSize(view, offset + id.width);
+    } catch (_) {
+      break;
+    }
+    const payload = offset + id.width + size.width;
+    if (id.id === 0x2ad7b1 && !size.unknown && size.value > 0 && payload + size.value <= end) {
+      const n = readEbmlUint(view, payload, size.value);
+      if (n > 0) scale = n;
+    } else if (id.id === 0x4489 && !size.unknown && (size.value === 4 || size.value === 8) && payload + size.value <= end) {
+      duration = size.value === 8 ? view.getFloat64(payload) : view.getFloat32(payload);
+    } else if (id.id === 0xe7 && !size.unknown && size.value > 0 && payload + size.value <= end) {
+      clusterTs = readEbmlUint(view, payload, size.value);
+    } else if ((id.id === 0xa3 || id.id === 0xa1) && !size.unknown && payload + 3 <= end) {
+      try {
+        const track = readEbmlVint(view, payload);
+        const abs = clusterTs + view.getInt16(payload + track.width);
+        if (abs > lastBlock) {
+          prevBlock = lastBlock;
+          lastBlock = abs;
+        }
+      } catch (_) { /* skip a truncated block */ }
+    }
+    const enter = id.id === 0x18538067 || id.id === 0x1549a966 || id.id === 0x1f43b675
+      || id.id === 0xa0 || id.id === 0x1c53bb6b || id.id === 0xbb || size.unknown;
+    offset = enter ? payload : payload + size.value;
+  }
+  const fromDuration = duration > 0 ? (duration * scale) / 1e9 : 0;
+  const lastDelta = lastBlock > prevBlock ? lastBlock - prevBlock : 0;
+  const fromBlocks = lastBlock > 0 ? ((lastBlock + lastDelta) * scale) / 1e9 : 0;
+  return Math.max(fromDuration, fromBlocks);
+}
+
+async function webmDurationSeconds(file) {
+  try {
+    const buffer = await file.arrayBuffer();
+    return readWebmTiming(buffer);
+  } catch (_) {
+    return 0;
+  }
+}
+
+function writeEbmlSize(value, width) {
+  const bytes = new Uint8Array(width);
+  let n = value;
+  for (let i = width - 1; i >= 0; i -= 1) {
+    bytes[i] = n & 0xff;
+    n >>= 8;
+  }
+  bytes[0] |= 1 << (8 - width);
+  return bytes;
+}
+
+async function withWebmDuration(blob, durationSec) {
+  if (!(durationSec > 0) || !isWebmBlob(blob)) return blob;
+  const buffer = await blob.arrayBuffer();
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  let scale = 1000000;
+  let infoPayload = -1;
+  let infoSizeOffset = -1;
+  let infoSizeWidth = 0;
+  let infoSizeUnknown = false;
+  let infoEnd = -1;
+  let durationAt = -1;
+  let durationLen = 0;
+  let offset = 0;
+  const end = bytes.length;
+  while (offset + 2 < end) {
+    let id;
+    let size;
+    try {
+      id = readEbmlId(view, offset);
+      size = readEbmlSize(view, offset + id.width);
+    } catch (_) {
+      break;
+    }
+    const payload = offset + id.width + size.width;
+    if (id.id === 0x1549a966) {
+      infoPayload = payload;
+      infoSizeOffset = offset + id.width;
+      infoSizeWidth = size.width;
+      infoSizeUnknown = size.unknown;
+      infoEnd = size.unknown ? end : payload + size.value;
+    } else if (id.id === 0x2ad7b1 && !size.unknown && payload + size.value <= end) {
+      const n = readEbmlUint(view, payload, size.value);
+      if (n > 0) scale = n;
+    } else if (id.id === 0x4489 && !size.unknown) {
+      durationAt = payload;
+      durationLen = size.value;
+    }
+    if (id.id === 0x18538067 || id.id === 0x1549a966) offset = payload;
+    else if (size.unknown) offset = payload;
+    else offset = payload + size.value;
+    if (infoPayload >= 0 && !infoSizeUnknown && offset >= infoEnd) break;
+  }
+  const durationValue = (durationSec * 1e9) / scale;
+  if (durationAt >= 0 && (durationLen === 4 || durationLen === 8)) {
+    const out = bytes.slice();
+    const outView = new DataView(out.buffer);
+    if (durationLen === 8) outView.setFloat64(durationAt, durationValue);
+    else outView.setFloat32(durationAt, durationValue);
+    return new Blob([out], { type: blob.type });
+  }
+  if (infoPayload < 0) return blob;
+  const durationEl = new Uint8Array(11);
+  durationEl[0] = 0x44;
+  durationEl[1] = 0x89;
+  durationEl[2] = 0x88;
+  new DataView(durationEl.buffer).setFloat64(3, durationValue);
+  const before = bytes.subarray(0, infoPayload);
+  const after = bytes.subarray(infoPayload);
+  if (!infoSizeUnknown && infoSizeWidth > 0) {
+    const oldSize = readEbmlSize(view, infoSizeOffset).value;
+    const sizeBytes = writeEbmlSize(oldSize + durationEl.length, infoSizeWidth);
+    if (sizeBytes.length === infoSizeWidth) {
+      const patched = bytes.slice();
+      patched.set(sizeBytes, infoSizeOffset);
+      const merged = new Uint8Array(patched.length + durationEl.length);
+      merged.set(patched.subarray(0, infoPayload), 0);
+      merged.set(durationEl, infoPayload);
+      merged.set(patched.subarray(infoPayload), infoPayload + durationEl.length);
+      return new Blob([merged], { type: blob.type });
+    }
+  }
+  const merged = new Uint8Array(before.length + durationEl.length + after.length);
+  merged.set(before, 0);
+  merged.set(durationEl, before.length);
+  merged.set(after, before.length + durationEl.length);
+  return new Blob([merged], { type: blob.type });
+}
+
+/** Prefer the known clip length. Do not follow a growing WebM buffer. */
 function clipDuration() {
   const known = Number(state.videoMeta?.duration) || 0;
-  const media = mediaDuration();
-  if (known > 0 && media > 0) return Math.max(known, media);
-  return media || known || 0;
+  if (known > 0) return known;
+  return mediaDuration();
 }
 
 /** FPS field: tracking sample rate and curve timestamps. */
@@ -633,12 +838,14 @@ function setClipMeta(text) {
 }
 
 function attachLocalFile(file, extras = {}) {
+  if (extras.camera) setCameraRecording(file);
+  else setCameraRecording(null);
   byId("sourceHint").textContent = "Loading clip…";
   revokeObjectUrl();
   const url = URL.createObjectURL(file);
   state.objectUrl = url;
   let done = false;
-  const onReady = () => {
+  const onReady = async () => {
     if (done) return;
     done = true;
     video.removeEventListener("loadedmetadata", onReady);
@@ -649,7 +856,10 @@ function attachLocalFile(file, extras = {}) {
       return;
     }
     const size = MocapTrack.trackFrameSize(vw, vh);
-    const duration = extras.duration || mediaDuration();
+    let duration = Number(extras.duration) || mediaDuration();
+    if (!(duration > 0) && isWebmBlob(file)) {
+      duration = await webmDurationSeconds(file);
+    }
     attachVideo({
       name: file.name || "clip",
       width: vw,
@@ -693,7 +903,9 @@ function attachVideo(meta, srcUrl) {
   emptyState.textContent = "Drop a video here, or use Upload / Camera, then draw a box around the thing you want to follow.";
   emptyState.classList.add("hidden");
   setClipMeta(`${meta.name}  ·  ${clipSizeLabel(meta)}  ·  ${clipFps().toFixed(2)} fps  ·  ${formatSeconds(meta.duration)}s`);
-  byId("sourceHint").textContent = "";
+  byId("sourceHint").textContent = state.cameraRecording
+    ? "Recording ready. Use Download to save the clip, or draw a box to track."
+    : "";
   byId("seek").max = meta.duration || 0;
   byId("seek").disabled = false;
   byId("playBtn").disabled = false;
@@ -715,12 +927,11 @@ function setBoxDrawing(on) {
 
 function refreshClipMeta() {
   if (!state.videoMeta || state.isLiveCamera) return;
-  const media = mediaDuration();
   const known = Number(state.videoMeta.duration) || 0;
-  // Only grow duration. A partial WebM buffer must not replace the recording length.
-  const duration = media > known ? media : (known || media);
+  const media = mediaDuration();
+  const duration = known > 0 ? known : media;
+  if (duration > 0) state.videoMeta.duration = duration;
   const fps = clipFps();
-  state.videoMeta.duration = duration;
   setClipMeta(`${state.videoMeta.name}  ·  ${clipSizeLabel(state.videoMeta)}  ·  ${fps.toFixed(2)} fps  ·  ${formatSeconds(duration)}s`);
   if (!state.isLiveCamera) {
     syncSeekBar();
@@ -1216,6 +1427,14 @@ byId("jsonInput").addEventListener("change", async (event) => {
   }
 });
 
+byId("downloadClipBtn").addEventListener("click", async () => {
+  const file = state.cameraRecording;
+  if (!file) return;
+  const duration = clipDuration() || await webmDurationSeconds(file);
+  const out = await withWebmDuration(file, duration);
+  downloadBlob(file.name || "camera.webm", out);
+});
+
 byId("camBtn").addEventListener("click", async () => {
   if (state.recorder) {
     byId("sourceHint").textContent = "Stopping recording…";
@@ -1240,7 +1459,7 @@ byId("camBtn").addEventListener("click", async () => {
     rec.ondataavailable = (event) => {
       if (event.data.size) chunks.push(event.data);
     };
-    rec.onstop = () => {
+    rec.onstop = async () => {
       const elapsed = Math.max(0.1, (Date.now() - state.recordingStartedAt) / 1000);
       stopCamera();
       clearLivePreview();
@@ -1250,8 +1469,10 @@ byId("camBtn").addEventListener("click", async () => {
         byId("sourceHint").textContent = "Recording was empty. Click Camera and record a bit longer.";
         return;
       }
-      const file = new File([blob], "camera.webm", { type: blob.type });
-      attachLocalFile(file, { duration: elapsed });
+      const fixed = await withWebmDuration(blob, elapsed);
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const file = new File([fixed], `camera-${stamp}.webm`, { type: blob.type });
+      attachLocalFile(file, { duration: elapsed, camera: true });
     };
     rec.start(250);
     startRecClock();
