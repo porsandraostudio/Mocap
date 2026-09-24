@@ -35,6 +35,7 @@ const state = {
   mediaTime: null,
   frameClockHandle: null,
   trackSeekPending: false,
+  frameReview: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,29 @@ function syncPlayButton() {
     return;
   }
   byId("playBtn").textContent = video.paused ? "Play" : "Pause";
+}
+
+function syncFrameReview() {
+  const active = state.frameReview && hasClip() && !state.isLiveCamera;
+  byId("reviewBtn").textContent = state.frameReview ? "Exit review" : "Review frames";
+  byId("previousFrameBtn").disabled = !active;
+  byId("nextFrameBtn").disabled = !active;
+  byId("frameLabel").textContent = active
+    ? `${clipFps().toFixed(2)} fps · use Prev / Next or arrow keys`
+    : "Frame review is paused";
+}
+
+function reviewFrame(step) {
+  if (!state.frameReview || state.isLiveCamera || !hasClip()) return;
+  const fps = clipFps();
+  const duration = clipDuration();
+  if (!(fps > 0) || !(duration > 0)) return;
+  const currentFrame = Math.round((Number(video.currentTime) || 0) * fps);
+  const lastFrame = Math.max(0, Math.round(duration * fps) - 1);
+  const nextFrame = Math.max(0, Math.min(lastFrame, currentFrame + step));
+  video.pause();
+  video.currentTime = nextFrame / fps;
+  syncPlayButton();
 }
 
 function download(name, text, type) {
@@ -1043,7 +1067,11 @@ function attachLocalFile(file, extras = {}) {
       byId("sourceHint").textContent = "Video has no usable frames. Record a bit longer and try again.";
       return;
     }
-    const size = MocapTrack.trackFrameSize(vw, vh);
+    // const size = MocapTrack.trackFrameSize(vw, vh);
+    const size = {
+          width: vw,
+          height: vh,
+        };
     const timing = await detectMediaTiming(file);
     let duration = Number(extras.duration) || mediaDuration();
     if (!(duration > 0) && timing.duration > 0) duration = timing.duration;
@@ -1085,6 +1113,7 @@ function attachVideo(meta, srcUrl) {
   state.exportFileName = null;
   state.bbox = null;
   state.isTracking = false;
+  state.frameReview = false;
   setBoxDrawing(false);
   clearFitResult();
   byId("progressWrap").classList.add("hidden");
@@ -1107,6 +1136,7 @@ function attachVideo(meta, srcUrl) {
   byId("seek").disabled = false;
   byId("playBtn").disabled = false;
   syncPlayButton();
+  syncFrameReview();
   byId("timeLabel").textContent = `0 / ${formatSeconds(meta.duration)}`;
   startFrameClock();
   drawOverlay();
@@ -1357,6 +1387,10 @@ byId("drawBtn").addEventListener("click", () => {
 
 byId("playBtn").addEventListener("click", () => {
   if (state.isLiveCamera) return;
+  if (state.frameReview) {
+    state.frameReview = false;
+    syncFrameReview();
+  }
   if (video.paused) {
     video.play().then(syncPlayButton).catch((err) => {
       byId("sourceHint").textContent = err.message || "Could not play this clip.";
@@ -1367,6 +1401,17 @@ byId("playBtn").addEventListener("click", () => {
     syncPlayButton();
   }
 });
+
+byId("reviewBtn").addEventListener("click", () => {
+  if (!hasClip() || state.isLiveCamera) return;
+  state.frameReview = !state.frameReview;
+  if (state.frameReview) video.pause();
+  syncPlayButton();
+  syncFrameReview();
+});
+
+byId("previousFrameBtn").addEventListener("click", () => reviewFrame(-1));
+byId("nextFrameBtn").addEventListener("click", () => reviewFrame(1));
 
 byId("seek").addEventListener("input", () => {
   if (state.isLiveCamera) return;
@@ -1687,6 +1732,11 @@ window.addEventListener("resize", () => {
 });
 
 window.addEventListener("keydown", (event) => {
+  if (state.frameReview && !state.isLiveCamera && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+    event.preventDefault();
+    reviewFrame(event.key === "ArrowLeft" ? -1 : 1);
+    return;
+  }
   if (event.code === "Space" && event.target === document.body) {
     event.preventDefault();
     byId("playBtn").click();
@@ -1695,3 +1745,4 @@ window.addEventListener("keydown", (event) => {
 
 resizeOverlay();
 drawPlot();
+syncFrameReview();

@@ -241,6 +241,19 @@ canvas#overlay { pointer-events: none; }
   margin: 0;
 }
 
+.frame-review {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 14px 10px;
+}
+
+.frame-review .hint {
+  margin-left: auto;
+  text-align: right;
+}
+
 .track-tools,
 .export-tools {
   padding: 12px 14px 14px;

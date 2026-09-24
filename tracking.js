@@ -1,12 +1,11 @@
 /**
  * In-browser marker tracker: compact bright/dark blob first, MOSSE as fallback.
- * Frames are capped at 1024 on the long side. Lost frames are not frozen in place;
- * tracking stops after a recovery window of misses.
+ * Frames are processed at the video's native resolution. Lost frames are not frozen
+ * in place; tracking stops after a recovery window of misses.
  */
 "use strict";
 
 const MocapTrack = (() => {
-  const TRACK_MAX_SIDE = 1024;
   const FILTER = 64;
   const LEARNING = 0.06;
   const PSR_MIN = 5.5;
@@ -19,22 +18,6 @@ const MocapTrack = (() => {
   const AREA_MAX = 2.7;
   const RADIUS_MIN = 0.38;
   const RADIUS_MAX = 2.4;
-
-  function trackFrameSize(width, height, maxSide = TRACK_MAX_SIDE) {
-    width = Math.floor(width);
-    height = Math.floor(height);
-    if (height > maxSide) {
-      const ratio = maxSide / height;
-      width = Math.floor(width * ratio);
-      height = maxSide;
-    }
-    if (width > maxSide) {
-      const ratio = maxSide / width;
-      height = Math.floor(height * ratio);
-      width = maxSide;
-    }
-    return { width: Math.max(1, width), height: Math.max(1, height) };
-  }
 
   function scaleBbox(bbox, srcW, srcH, dstW, dstH) {
     const sx = srcW ? dstW / srcW : 1;
@@ -685,12 +668,6 @@ const MocapTrack = (() => {
       const scaleY = this.winH / this.h;
       let dx = (px + sub.dx - (this.w - 1) / 2) * scaleX;
       let dy = (py + sub.dy - (this.h - 1) / 2) * scaleY;
-      const jump = Math.hypot(dx, dy);
-      const limit = 0.4 * Math.hypot(this.winW, this.winH);
-      if (jump > limit && jump > 0) {
-        dx *= limit / jump;
-        dy *= limit / jump;
-      }
       return {
         x: this.cx + dx,
         y: this.cy + dy,
@@ -813,14 +790,13 @@ const MocapTrack = (() => {
       bbox,
       startTime = 0,
       fps: fpsOption = 30,
-      maxSide = TRACK_MAX_SIDE,
       shouldStop = () => false,
       onProgress = null,
     } = options;
 
     const nativeW = video.videoWidth || 1;
     const nativeH = video.videoHeight || 1;
-    const size = trackFrameSize(nativeW, nativeH, maxSide);
+    const size = { width: nativeW, height: nativeH };
     const canvas = document.createElement("canvas");
     canvas.width = size.width;
     canvas.height = size.height;
@@ -925,7 +901,6 @@ const MocapTrack = (() => {
   }
 
   const api = {
-    trackFrameSize,
     trackHtmlVideo,
     createTracker: () => new MosseTracker(),
     detectBrightMarkerBbox,

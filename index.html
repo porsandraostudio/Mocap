@@ -52,6 +52,12 @@
           <input type="range" id="seek" min="0" max="0" step="0.001" value="0" />
           <span class="time" id="timeLabel">0 / 0</span>
         </div>
+        <div class="frame-review" id="frameReview" aria-label="Frame review controls">
+          <button type="button" class="btn ghost" id="reviewBtn">Review frames</button>
+          <button type="button" class="icon-btn" id="previousFrameBtn" title="Previous frame" aria-label="Previous frame" disabled>Prev</button>
+          <button type="button" class="icon-btn" id="nextFrameBtn" title="Next frame" aria-label="Next frame" disabled>Next</button>
+          <span class="hint" id="frameLabel">Frame review is paused</span>
+        </div>
         <div class="track-tools">
           <div class="row">
             <label class="field grow">
