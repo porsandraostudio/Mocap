@@ -32,10 +32,14 @@ const state = {
   recordingClockTimer: null,
   recordingStartedAt: 0,
   isTracking: false,
+  trackComplete: false,
   mediaTime: null,
   frameClockHandle: null,
   trackSeekPending: false,
   frameReview: false,
+  trackingRunId: 0,
+  videoLoadId: 0,
+  pendingVideoMetadataHandler: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -182,381 +186,11 @@ function mediaDuration() {
   return 0;
 }
 
-function isWebmBlob(file) {
-  if (!file) return false;
-  if (file.type && /webm/i.test(file.type)) return true;
-  return /\.webm$/i.test(file.name || "");
-}
-
-function isMp4Like(file) {
-  if (!file) return false;
-  if (file.type && /(mp4|quicktime|m4v)/i.test(file.type)) return true;
-  return /\.(mp4|m4v|mov)$/i.test(file.name || "");
-}
-
-function readEbmlId(view, offset) {
-  const first = view.getUint8(offset);
-  let width = 1;
-  let mask = 0x80;
-  while (width < 4 && !(first & mask)) {
-    width += 1;
-    mask >>= 1;
-  }
-  if (!(first & mask)) throw new Error("bad id");
-  let id = 0;
-  for (let i = 0; i < width; i += 1) id = (id << 8) | view.getUint8(offset + i);
-  return { id, width };
-}
-
-function readEbmlSize(view, offset) {
-  const first = view.getUint8(offset);
-  let width = 1;
-  let mask = 0x80;
-  while (width < 8 && !(first & mask)) {
-    width += 1;
-    mask >>= 1;
-  }
-  if (!(first & mask)) throw new Error("bad size");
-  const dataMask = mask - 1;
-  let unknown = (first & dataMask) === dataMask;
-  let value = first & dataMask;
-  for (let i = 1; i < width; i += 1) {
-    const b = view.getUint8(offset + i);
-    if (b !== 0xff) unknown = false;
-    value = value * 256 + b;
-  }
-  return { value, width, unknown };
-}
-
-function readEbmlVint(view, offset) {
-  const first = view.getUint8(offset);
-  let width = 1;
-  let mask = 0x80;
-  while (width < 8 && !(first & mask)) {
-    width += 1;
-    mask >>= 1;
-  }
-  let value = first & (mask - 1);
-  for (let i = 1; i < width; i += 1) value = value * 256 + view.getUint8(offset + i);
-  return { value, width };
-}
-
-function readEbmlUint(view, offset, len) {
-  let n = 0;
-  for (let i = 0; i < len; i += 1) n = n * 256 + view.getUint8(offset + i);
-  return n;
-}
-
-function readWebmTiming(buffer) {
-  const view = new DataView(buffer);
-  const end = view.byteLength;
-  let scale = 1000000;
-  let duration = 0;
-  let clusterTs = 0;
-  let lastBlock = 0;
-  let prevBlock = 0;
-  let offset = 0;
-  while (offset + 2 < end) {
-    let id;
-    let size;
-    try {
-      id = readEbmlId(view, offset);
-      size = readEbmlSize(view, offset + id.width);
-    } catch (_) {
-      break;
-    }
-    const payload = offset + id.width + size.width;
-    if (id.id === 0x2ad7b1 && !size.unknown && size.value > 0 && payload + size.value <= end) {
-      const n = readEbmlUint(view, payload, size.value);
-      if (n > 0) scale = n;
-    } else if (id.id === 0x4489 && !size.unknown && (size.value === 4 || size.value === 8) && payload + size.value <= end) {
-      duration = size.value === 8 ? view.getFloat64(payload) : view.getFloat32(payload);
-    } else if (id.id === 0xe7 && !size.unknown && size.value > 0 && payload + size.value <= end) {
-      clusterTs = readEbmlUint(view, payload, size.value);
-    } else if ((id.id === 0xa3 || id.id === 0xa1) && !size.unknown && payload + 3 <= end) {
-      try {
-        const track = readEbmlVint(view, payload);
-        const abs = clusterTs + view.getInt16(payload + track.width);
-        if (abs > lastBlock) {
-          prevBlock = lastBlock;
-          lastBlock = abs;
-        }
-      } catch (_) { /* skip a truncated block */ }
-    }
-    const enter = id.id === 0x18538067 || id.id === 0x1549a966 || id.id === 0x1f43b675
-      || id.id === 0xa0 || id.id === 0x1c53bb6b || id.id === 0xbb || size.unknown;
-    offset = enter ? payload : payload + size.value;
-  }
-  const fromDuration = duration > 0 ? (duration * scale) / 1e9 : 0;
-  const lastDelta = lastBlock > prevBlock ? lastBlock - prevBlock : 0;
-  const fromBlocks = lastBlock > 0 ? ((lastBlock + lastDelta) * scale) / 1e9 : 0;
-  return Math.max(fromDuration, fromBlocks);
-}
-
-async function webmDurationSeconds(file) {
-  try {
-    const buffer = await file.arrayBuffer();
-    return readWebmTiming(buffer);
-  } catch (_) {
-    return 0;
-  }
-}
-
-function readFourCC(view, offset) {
-  if (offset + 4 > view.byteLength) return "";
-  return String.fromCharCode(
-    view.getUint8(offset),
-    view.getUint8(offset + 1),
-    view.getUint8(offset + 2),
-    view.getUint8(offset + 3),
+function confirmReplaceCurrentClip() {
+  const hasCurrentData = state.videoMeta || state.track || state.loadedCurveSource || state.fitResult;
+  return !hasCurrentData || window.confirm(
+    "Replace the current video? Its tracking data, curve, and exports will be cleared.",
   );
-}
-
-function walkIsoBoxes(view, start, end, onBox) {
-  let offset = start;
-  while (offset + 8 <= end) {
-    let size = view.getUint32(offset);
-    const type = readFourCC(view, offset + 4);
-    let header = 8;
-    if (size === 1) {
-      if (offset + 16 > end) break;
-      size = Number(view.getBigUint64(offset + 8));
-      header = 16;
-    } else if (size === 0) {
-      size = end - offset;
-    }
-    if (!Number.isFinite(size) || size < header) break;
-    const boxEnd = Math.min(end, offset + size);
-    const payload = offset + header;
-    const enter = onBox(type, payload, boxEnd);
-    if (enter) walkIsoBoxes(view, payload, boxEnd, onBox);
-    if (size === 0) break;
-    offset = boxEnd;
-  }
-}
-
-function findIsoBoxOffset(view, type) {
-  for (let i = 4; i + 4 <= view.byteLength; i += 1) {
-    if (readFourCC(view, i) === type) return Math.max(0, i - 4);
-  }
-  return -1;
-}
-
-function parseMp4Timing(buffer) {
-  const view = new DataView(buffer);
-  const tracks = [];
-
-  const readTrack = (payload, boxEnd) => {
-    const track = { vide: false, timescale: 0, duration: 0, samples: 0, delta: 0, codec: "" };
-    walkIsoBoxes(view, payload, boxEnd, (type, p, end) => {
-      if (type === "mdia" || type === "minf" || type === "stbl") return true;
-      if (type === "hdlr" && p + 12 <= end) {
-        if (readFourCC(view, p + 8) === "vide") track.vide = true;
-      } else if (type === "mdhd" && p + 4 <= end) {
-        const version = view.getUint8(p);
-        if (version === 1 && p + 32 <= end) {
-          track.timescale = view.getUint32(p + 20);
-          const dur = Number(view.getBigUint64(p + 24));
-          if (dur > 0) track.duration = dur;
-        } else if (p + 20 <= end) {
-          track.timescale = view.getUint32(p + 12);
-          const dur = view.getUint32(p + 16);
-          if (dur > 0) track.duration = dur;
-        }
-      } else if (type === "stts" && p + 8 <= end) {
-        const count = view.getUint32(p + 4);
-        let samples = 0;
-        let weighted = 0;
-        let firstDelta = 0;
-        for (let i = 0; i < count; i += 1) {
-          const off = p + 8 + i * 8;
-          if (off + 8 > end) break;
-          const n = view.getUint32(off);
-          const delta = view.getUint32(off + 4);
-          samples += n;
-          weighted += n * delta;
-          if (!firstDelta && delta) firstDelta = delta;
-        }
-        track.samples = samples;
-        track.delta = samples ? weighted / samples : firstDelta;
-      } else if (type === "stsd" && p + 16 <= end) {
-        track.codec = readFourCC(view, p + 12);
-      }
-      return false;
-    });
-    return track;
-  };
-
-  const scan = (start) => {
-    walkIsoBoxes(view, start, view.byteLength, (type, payload, boxEnd) => {
-      if (type === "moov") return true;
-      if (type === "trak") {
-        tracks.push(readTrack(payload, boxEnd));
-        return false;
-      }
-      return false;
-    });
-  };
-  scan(0);
-  if (!tracks.length) {
-    const moovAt = findIsoBoxOffset(view, "moov");
-    if (moovAt >= 0) scan(moovAt);
-  }
-
-  const videoTrack = tracks.find((t) => t.vide && t.timescale > 0) || tracks.find((t) => t.timescale > 0);
-  if (!videoTrack) return { fps: 0, duration: 0, codec: "" };
-  let fps = 0;
-  if (videoTrack.duration > 0 && videoTrack.samples > 1) {
-    fps = (videoTrack.samples * videoTrack.timescale) / videoTrack.duration;
-  } else if (videoTrack.delta > 0 && videoTrack.timescale > 0) {
-    fps = videoTrack.timescale / videoTrack.delta;
-  }
-  const duration = videoTrack.timescale > 0 && videoTrack.duration > 0
-    ? videoTrack.duration / videoTrack.timescale
-    : 0;
-  if (!(fps >= 1 && fps <= 240)) fps = 0;
-  return { fps, duration, codec: videoTrack.codec || "" };
-}
-
-function parseWebmTimingInfo(buffer) {
-  const duration = readWebmTiming(buffer);
-  const view = new DataView(buffer);
-  const end = view.byteLength;
-  let defaultDuration = 0;
-  let offset = 0;
-  while (offset + 2 < end) {
-    let id;
-    let size;
-    try {
-      id = readEbmlId(view, offset);
-      size = readEbmlSize(view, offset + id.width);
-    } catch (_) {
-      break;
-    }
-    const payload = offset + id.width + size.width;
-    if (id.id === 0x23e383 && !size.unknown && size.value > 0 && payload + size.value <= end) {
-      defaultDuration = readEbmlUint(view, payload, size.value);
-    }
-    const enter = id.id === 0x18538067 || id.id === 0x1549a966 || id.id === 0x1f43b675
-      || id.id === 0x1654ae6b || id.id === 0xae
-      || id.id === 0xa0 || id.id === 0x1c53bb6b || id.id === 0xbb || size.unknown;
-    offset = enter ? payload : payload + size.value;
-  }
-  let fps = 0;
-  if (defaultDuration > 0) fps = 1e9 / defaultDuration;
-  if (!(fps >= 1 && fps <= 240)) fps = 0;
-  return { fps, duration, codec: "vp8" };
-}
-
-async function detectMediaTiming(file) {
-  const empty = { fps: 0, duration: 0, codec: "" };
-  if (!file) return empty;
-  try {
-    const chunk = 8 * 1024 * 1024;
-    const head = await file.slice(0, Math.min(file.size, chunk)).arrayBuffer();
-    const tryParse = (buffer) => {
-      if (isWebmBlob(file)) return parseWebmTimingInfo(buffer);
-      return parseMp4Timing(buffer);
-    };
-    let timing = tryParse(head);
-    if (timing.fps > 0 || timing.duration > 0) return timing;
-    if (file.size > chunk) {
-      const tail = await file.slice(Math.max(0, file.size - chunk)).arrayBuffer();
-      timing = tryParse(tail);
-      if (timing.fps > 0 || timing.duration > 0) return timing;
-    }
-  } catch (_) { /* fall through */ }
-  return empty;
-}
-
-function writeEbmlSize(value, width) {
-  const bytes = new Uint8Array(width);
-  let n = value;
-  for (let i = width - 1; i >= 0; i -= 1) {
-    bytes[i] = n & 0xff;
-    n >>= 8;
-  }
-  bytes[0] |= 1 << (8 - width);
-  return bytes;
-}
-
-async function withWebmDuration(blob, durationSec) {
-  if (!(durationSec > 0) || !isWebmBlob(blob)) return blob;
-  const buffer = await blob.arrayBuffer();
-  const view = new DataView(buffer);
-  const bytes = new Uint8Array(buffer);
-  let scale = 1000000;
-  let infoPayload = -1;
-  let infoSizeOffset = -1;
-  let infoSizeWidth = 0;
-  let infoSizeUnknown = false;
-  let infoEnd = -1;
-  let durationAt = -1;
-  let durationLen = 0;
-  let offset = 0;
-  const end = bytes.length;
-  while (offset + 2 < end) {
-    let id;
-    let size;
-    try {
-      id = readEbmlId(view, offset);
-      size = readEbmlSize(view, offset + id.width);
-    } catch (_) {
-      break;
-    }
-    const payload = offset + id.width + size.width;
-    if (id.id === 0x1549a966) {
-      infoPayload = payload;
-      infoSizeOffset = offset + id.width;
-      infoSizeWidth = size.width;
-      infoSizeUnknown = size.unknown;
-      infoEnd = size.unknown ? end : payload + size.value;
-    } else if (id.id === 0x2ad7b1 && !size.unknown && payload + size.value <= end) {
-      const n = readEbmlUint(view, payload, size.value);
-      if (n > 0) scale = n;
-    } else if (id.id === 0x4489 && !size.unknown) {
-      durationAt = payload;
-      durationLen = size.value;
-    }
-    if (id.id === 0x18538067 || id.id === 0x1549a966) offset = payload;
-    else if (size.unknown) offset = payload;
-    else offset = payload + size.value;
-    if (infoPayload >= 0 && !infoSizeUnknown && offset >= infoEnd) break;
-  }
-  const durationValue = (durationSec * 1e9) / scale;
-  if (durationAt >= 0 && (durationLen === 4 || durationLen === 8)) {
-    const out = bytes.slice();
-    const outView = new DataView(out.buffer);
-    if (durationLen === 8) outView.setFloat64(durationAt, durationValue);
-    else outView.setFloat32(durationAt, durationValue);
-    return new Blob([out], { type: blob.type });
-  }
-  if (infoPayload < 0) return blob;
-  const durationEl = new Uint8Array(11);
-  durationEl[0] = 0x44;
-  durationEl[1] = 0x89;
-  durationEl[2] = 0x88;
-  new DataView(durationEl.buffer).setFloat64(3, durationValue);
-  const before = bytes.subarray(0, infoPayload);
-  const after = bytes.subarray(infoPayload);
-  if (!infoSizeUnknown && infoSizeWidth > 0) {
-    const oldSize = readEbmlSize(view, infoSizeOffset).value;
-    const sizeBytes = writeEbmlSize(oldSize + durationEl.length, infoSizeWidth);
-    if (sizeBytes.length === infoSizeWidth) {
-      const patched = bytes.slice();
-      patched.set(sizeBytes, infoSizeOffset);
-      const merged = new Uint8Array(patched.length + durationEl.length);
-      merged.set(patched.subarray(0, infoPayload), 0);
-      merged.set(durationEl, infoPayload);
-      merged.set(patched.subarray(infoPayload), infoPayload + durationEl.length);
-      return new Blob([merged], { type: blob.type });
-    }
-  }
-  const merged = new Uint8Array(before.length + durationEl.length + after.length);
-  merged.set(before, 0);
-  merged.set(durationEl, before.length);
-  merged.set(after, before.length + durationEl.length);
-  return new Blob([merged], { type: blob.type });
 }
 
 /** Prefer the known clip length. Do not follow a growing WebM buffer. */
@@ -623,40 +257,17 @@ function resizeOverlay() {
   drawOverlay();
 }
 
-function trackFrameSize() {
-  return {
-    tw: Number(state.track?.width) || video.videoWidth || 1,
-    th: Number(state.track?.height) || video.videoHeight || 1,
-    vw: video.videoWidth || Number(state.videoMeta?.width) || 1,
-    vh: video.videoHeight || Number(state.videoMeta?.height) || 1,
-  };
-}
-
-/** Map tracking-frame pixels onto the native video the player shows. */
+/** Tracking and display both use the video's native pixel coordinates. */
 function trackToNative(x, y) {
-  const { tw, th, vw, vh } = trackFrameSize();
-  return { x: x * vw / tw, y: y * vh / th };
+  return { x, y };
 }
 
 function boxToNative(box) {
-  if (!box) return box;
-  if (!state.track) return box;
-  const a = trackToNative(box[0], box[1]);
-  const b = trackToNative(box[0] + box[2], box[1] + box[3]);
-  return [a.x, a.y, b.x - a.x, b.y - a.y];
+  return box;
 }
 
 function nativeToTrackBox(box) {
-  const tw = Number(state.videoMeta?.track_width) || video.videoWidth || 1;
-  const th = Number(state.videoMeta?.track_height) || video.videoHeight || 1;
-  const vw = video.videoWidth || Number(state.videoMeta?.width) || 1;
-  const vh = video.videoHeight || Number(state.videoMeta?.height) || 1;
-  return [
-    Math.floor(box[0] * tw / vw),
-    Math.floor(box[1] * th / vh),
-    Math.max(1, Math.floor(box[2] * tw / vw)),
-    Math.max(1, Math.floor(box[3] * th / vh)),
-  ];
+  return box;
 }
 
 function displayedTime() {
@@ -937,7 +548,11 @@ function drawPlot() {
   plotCtx.restore();
   plotCtx.fillText("duration (s)", cssW - 92, cssH - 10);
 
-  const data = (!state.hasLoadedCurve && trackedSeries()) || state.scaledSeries;
+  let data = null;
+  if (!state.isTracking) {
+    if (state.hasLoadedCurve) data = state.scaledSeries;
+    else if (state.trackComplete) data = trackedSeries() || state.scaledSeries;
+  }
   if (!data) {
     plotCtx.strokeStyle = "#c9d0d9";
     plotCtx.beginPath();
@@ -1050,6 +665,50 @@ function setClipMeta(text) {
 }
 
 function attachLocalFile(file, extras = {}) {
+  if (!confirmReplaceCurrentClip()) return;
+  const loadId = state.videoLoadId + 1;
+  state.videoLoadId = loadId;
+  state.trackingRunId += 1;
+  state.isTracking = false;
+  state.trackComplete = false;
+  if (state.pendingVideoMetadataHandler) {
+    video.removeEventListener("loadedmetadata", state.pendingVideoMetadataHandler);
+    state.pendingVideoMetadataHandler = null;
+  }
+  clearTimeout(splineFitTimer);
+  state.videoMeta = null;
+  state.track = null;
+  state.scaledSeries = null;
+  state.hasLoadedCurve = false;
+  state.loadedCurveSource = null;
+  state.hasResmoothedLoadedCurve = false;
+  state.exportFileName = null;
+  state.bbox = null;
+  state.isDrawingBox = false;
+  state.drawStartPoint = null;
+  state.trackSeekPending = false;
+  state.frameReview = false;
+  clearFitResult();
+  setBoxDrawing(false);
+  byId("trackBtn").textContent = "Track";
+  byId("progressWrap").classList.add("hidden");
+  byId("progressBar").style.width = "0%";
+  byId("progressText").textContent = "Tracking…";
+  byId("fitHint").textContent = "Track or load JSON. Black dots are knots.";
+  byId("seek").disabled = true;
+  byId("seek").max = 0;
+  byId("seek").value = 0;
+  byId("playBtn").disabled = true;
+  byId("playBtn").textContent = "Play";
+  byId("timeLabel").textContent = "0 / 0";
+  setClipMeta("Loading clip…");
+  emptyState.textContent = "Loading video…";
+  emptyState.classList.remove("hidden");
+  syncFrameReview();
+  drawOverlay();
+  drawPlot();
+  video.pause();
+
   if (extras.camera) setCameraRecording(file);
   else setCameraRecording(null);
   byId("sourceHint").textContent = "Loading clip…";
@@ -1058,25 +717,25 @@ function attachLocalFile(file, extras = {}) {
   state.objectUrl = url;
   let done = false;
   const onReady = async () => {
+    if (loadId !== state.videoLoadId) return;
     if (done) return;
     done = true;
     video.removeEventListener("loadedmetadata", onReady);
+    state.pendingVideoMetadataHandler = null;
     const vw = video.videoWidth || 0;
     const vh = video.videoHeight || 0;
     if (vw < 8 || vh < 8) {
       byId("sourceHint").textContent = "Video has no usable frames. Record a bit longer and try again.";
       return;
     }
-    // const size = MocapTrack.trackFrameSize(vw, vh);
-    const size = {
-          width: vw,
-          height: vh,
-        };
-    const timing = await detectMediaTiming(file);
+    const size = { width: vw, height: vh };
+    const timing = await MocapMedia.detectMediaTiming(file);
+    if (loadId !== state.videoLoadId) return;
     let duration = Number(extras.duration) || mediaDuration();
     if (!(duration > 0) && timing.duration > 0) duration = timing.duration;
-    if (!(duration > 0) && isWebmBlob(file)) {
-      duration = await webmDurationSeconds(file);
+    if (!(duration > 0) && MocapMedia.isWebmBlob(file)) {
+      duration = await MocapMedia.webmDurationSeconds(file);
+      if (loadId !== state.videoLoadId) return;
     }
     const fps = extras.fps || timing.fps || 30;
     attachVideo({
@@ -1090,13 +749,12 @@ function attachLocalFile(file, extras = {}) {
       nframes: duration > 0 ? Math.round(duration * fps) : 0,
       codec: timing.codec || "",
     }, url);
-    if (/^(hvc1|hev1|hvcC)$/i.test(timing.codec || "")) {
-      byId("sourceHint").textContent = "This clip is HEVC. If it will not play, re-export as H.264 MP4.";
-    }
   };
+  state.pendingVideoMetadataHandler = onReady;
   video.addEventListener("loadedmetadata", onReady);
   video.removeAttribute("src");
   video.srcObject = null;
+  video.load();
   video.src = url;
   if (video.readyState >= 1) onReady();
 }
@@ -1113,6 +771,7 @@ function attachVideo(meta, srcUrl) {
   state.exportFileName = null;
   state.bbox = null;
   state.isTracking = false;
+  state.trackComplete = false;
   state.frameReview = false;
   setBoxDrawing(false);
   clearFitResult();
@@ -1182,6 +841,8 @@ function clearLivePreview() {
 }
 
 async function showLivePreview(stream) {
+  state.trackingRunId += 1;
+  state.videoMeta = null;
   state.isLiveCamera = true;
   state.track = null;
   state.bbox = null;
@@ -1249,6 +910,7 @@ function applyTrackPreview(preview) {
 
 function failTracking(message) {
   state.isTracking = false;
+  state.trackComplete = false;
   byId("progressWrap").classList.remove("hidden");
   byId("progressText").textContent = message || "Tracking failed";
   drawOverlay();
@@ -1256,6 +918,7 @@ function failTracking(message) {
 
 function finishTracking(result) {
   state.isTracking = false;
+  state.trackComplete = true;
   state.track = result;
   clearFitResult();
   byId("progressWrap").classList.remove("hidden");
@@ -1469,8 +1132,11 @@ video.addEventListener("progress", refreshClipMeta);
 byId("trackBtn").addEventListener("click", async () => {
   if (state.isTracking) {
     state.isTracking = false;
+    state.trackComplete = false;
+    state.trackingRunId += 1;
     byId("trackBtn").textContent = "Track";
     byId("progressText").textContent = "Stopping…";
+    drawPlot();
     return;
   }
   if (!hasClip() || !state.bbox) {
@@ -1485,8 +1151,12 @@ byId("trackBtn").addEventListener("click", async () => {
   const trackBox = nativeToTrackBox(box);
   const tw = Number(state.videoMeta?.track_width) || video.videoWidth;
   const th = Number(state.videoMeta?.track_height) || video.videoHeight;
+  const runId = state.trackingRunId + 1;
+  state.trackingRunId = runId;
   state.isTracking = true;
+  state.trackComplete = false;
   state.trackSeekPending = false;
+  state.scaledSeries = null;
   state.track = {
     times: [0],
     x: [trackBox[0] + trackBox[2] / 2],
@@ -1514,8 +1184,9 @@ byId("trackBtn").addEventListener("click", async () => {
       bbox: state.bbox,
       startTime,
       fps,
-      shouldStop: () => !state.isTracking,
+      shouldStop: () => !state.isTracking || runId !== state.trackingRunId,
       onProgress: (preview, done, total) => {
+        if (runId !== state.trackingRunId || !state.isTracking) return;
         const pct = Math.round((total ? done / total : 0) * 100);
         byId("progressBar").style.width = `${pct}%`;
         const lost = preview.lost ? ` · lost ${preview.lost}` : "";
@@ -1524,15 +1195,17 @@ byId("trackBtn").addEventListener("click", async () => {
         drawOverlay();
       },
     });
+    if (runId !== state.trackingRunId) return;
     if (result?.times?.length >= 4) {
       finishTracking(result);
     } else {
       failTracking(state.isTracking ? "Tracking failed" : "Stopped");
     }
   } catch (err) {
+    if (runId !== state.trackingRunId) return;
     failTracking(err.message || "Tracking failed");
   } finally {
-    byId("trackBtn").textContent = "Track";
+    if (runId === state.trackingRunId) byId("trackBtn").textContent = "Track";
   }
 });
 
@@ -1671,8 +1344,8 @@ byId("jsonInput").addEventListener("change", async (event) => {
 byId("downloadClipBtn").addEventListener("click", async () => {
   const file = state.cameraRecording;
   if (!file) return;
-  const duration = clipDuration() || await webmDurationSeconds(file);
-  const out = await withWebmDuration(file, duration);
+  const duration = clipDuration() || await MocapMedia.webmDurationSeconds(file);
+  const out = await MocapMedia.withWebmDuration(file, duration);
   downloadBlob(file.name || "camera.webm", out);
 });
 
@@ -1684,6 +1357,7 @@ byId("camBtn").addEventListener("click", async () => {
     state.recorder = null;
     return;
   }
+  if (!confirmReplaceCurrentClip()) return;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -1710,7 +1384,7 @@ byId("camBtn").addEventListener("click", async () => {
         byId("sourceHint").textContent = "Recording was empty. Click Camera and record a bit longer.";
         return;
       }
-      const fixed = await withWebmDuration(blob, elapsed);
+      const fixed = await MocapMedia.withWebmDuration(blob, elapsed);
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const file = new File([fixed], `camera-${stamp}.webm`, { type: blob.type });
       attachLocalFile(file, { duration: elapsed, camera: true });

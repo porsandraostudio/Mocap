@@ -25,7 +25,7 @@ jobs:
       - name: Stage site
         run: |
           mkdir -p _site
-          cp index.html styles.css app.js tracking.js spline.js favicon.svg .nojekyll _site/
+          cp index.html styles.css app.js tracking.js spline.js media.js favicon.svg .nojekyll _site/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

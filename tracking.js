@@ -19,17 +19,6 @@ const MocapTrack = (() => {
   const RADIUS_MIN = 0.38;
   const RADIUS_MAX = 2.4;
 
-  function scaleBbox(bbox, srcW, srcH, dstW, dstH) {
-    const sx = srcW ? dstW / srcW : 1;
-    const sy = srcH ? dstH / srcH : 1;
-    return [
-      Math.floor(bbox[0] * sx),
-      Math.floor(bbox[1] * sy),
-      Math.max(1, Math.floor(bbox[2] * sx)),
-      Math.max(1, Math.floor(bbox[3] * sy)),
-    ];
-  }
-
   function clampBbox(bbox, frameW, frameH) {
     let [x, y, w, h] = bbox.map(Number);
     w = Math.max(1, w);
@@ -550,12 +539,11 @@ const MocapTrack = (() => {
       );
     }
 
-    _setSizeFromRadius(radius) {
+    _setSearchSizeFromRadius(radius) {
       const r = Math.max(3, radius);
-      this.boxW = Math.max(6, r * 2.25);
-      this.boxH = this.boxW;
-      this.winW = Math.max(8, this.boxW * WINDOW_PAD);
-      this.winH = Math.max(8, this.boxH * WINDOW_PAD);
+      const searchSize = Math.max(6, r * 2.25);
+      this.winW = Math.max(8, searchSize * WINDOW_PAD);
+      this.winH = Math.max(8, searchSize * WINDOW_PAD);
     }
 
     init(imageData, bbox, fps = 30) {
@@ -564,6 +552,8 @@ const MocapTrack = (() => {
       this.frameW = frameW;
       this.frameH = frameH;
       let box = clampBbox(bbox, frameW, frameH);
+      this.boxW = box[2];
+      this.boxH = box[3];
       this.appearance = sampleAppearance(imageData, box);
       const [icx, icy] = boxCenter(box);
       const seed = markerBlob(
@@ -596,7 +586,7 @@ const MocapTrack = (() => {
       this.cy = cy;
       this.outX = cx;
       this.outY = cy;
-      this._setSizeFromRadius(this.appearance.radius);
+      this._setSearchSizeFromRadius(this.appearance.radius);
       this.smoothX = new OneEuro(fps);
       this.smoothY = new OneEuro(fps);
       this.aRe.fill(0);
@@ -742,7 +732,7 @@ const MocapTrack = (() => {
           model.radius = 0.9 * (model.radius || blob.radius) + 0.1 * blob.radius;
           model.boxLum = 0.92 * model.boxLum + 0.08 * blob.meanLum;
           model.mid = 0.92 * model.mid + 0.08 * ((blob.meanLum + model.ringLum) / 2);
-          this._setSizeFromRadius(model.radius);
+          this._setSearchSizeFromRadius(model.radius);
         }
       } else {
         this.outX = this.smoothX.filter(this.cx);
@@ -815,11 +805,7 @@ const MocapTrack = (() => {
     ctx.drawImage(video, 0, 0, size.width, size.height);
     let frame = ctx.getImageData(0, 0, size.width, size.height);
 
-    const trackBbox = clampBbox(
-      scaleBbox(bbox, nativeW, nativeH, size.width, size.height),
-      size.width,
-      size.height,
-    );
+    const trackBbox = clampBbox(bbox, size.width, size.height);
     const tracker = new MosseTracker();
     if (!tracker.init(frame, trackBbox, fps)) {
       throw new Error("Tracker failed to initialize on the selected box.");
@@ -904,7 +890,6 @@ const MocapTrack = (() => {
     trackHtmlVideo,
     createTracker: () => new MosseTracker(),
     detectBrightMarkerBbox,
-    scaleBbox,
     clampBbox,
     LOST_LIMIT,
   };
