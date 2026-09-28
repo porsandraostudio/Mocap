@@ -37,6 +37,8 @@ const state = {
   frameClockHandle: null,
   trackSeekPending: false,
   frameReview: false,
+  frameEditDrag: null,
+  frameEditIndex: -1,
   trackingRunId: 0,
   videoLoadId: 0,
   pendingVideoMetadataHandler: null,
@@ -96,14 +98,63 @@ function syncPlayButton() {
   byId("playBtn").textContent = video.paused ? "Play" : "Pause";
 }
 
+function getFrameEditIndex() {
+  if (!state.track?.times?.length) return -1;
+  if (Number.isInteger(state.frameEditIndex) && state.frameEditIndex >= 0) {
+    return Math.min(state.track.times.length - 1, state.frameEditIndex);
+  }
+  return Math.max(0, currentIndex());
+}
+
+function seekToEditFrame(index) {
+  if (!state.track?.times?.length) return;
+  const fps = Number(state.track.fps) || clipFps();
+  const startFrame = Number(state.track.start_frame) || 0;
+  const safeIndex = Math.max(0, Math.min(state.track.times.length - 1, index));
+  state.frameEditIndex = safeIndex;
+  const frameOffset = state.track.frame_indices?.[safeIndex] ?? safeIndex;
+  const frame = startFrame + frameOffset;
+  const duration = clipDuration();
+  video.pause();
+  video.currentTime = Math.max(0, Math.min(duration || Infinity, frame / fps));
+  drawOverlay();
+  drawPlot();
+  syncFrameReview();
+}
+
 function syncFrameReview() {
   const active = state.frameReview && hasClip() && !state.isLiveCamera;
-  byId("reviewBtn").textContent = state.frameReview ? "Exit review" : "Review frames";
+  const editing = active && state.trackComplete && !!state.track;
+
+  byId("reviewBtn").textContent = state.frameReview
+    ? (editing ? "Exit frame edit" : "Exit review")
+    : (state.trackComplete ? "Edit frames" : "Review frames");
+
   byId("previousFrameBtn").disabled = !active;
   byId("nextFrameBtn").disabled = !active;
-  byId("frameLabel").textContent = active
-    ? `${clipFps().toFixed(2)} fps · use Prev / Next or arrow keys`
-    : "Frame review is paused";
+
+  if (!active) {
+    byId("frameLabel").textContent = "Frame review is paused";
+    overlay.style.cursor = "";
+    return;
+  }
+
+  overlay.style.cursor = editing ? "grab" : "default";
+
+  if (editing) {
+    const idx = Math.max(0, currentIndex());
+    const frameOffset = state.track.frame_indices?.[idx] ?? idx;
+    const frame = (Number(state.track.start_frame) || 0) + frameOffset;
+    const total = Math.max(
+      frame + 1,
+      Math.round(clipDuration() * Number(state.track.fps || clipFps()))
+    );
+    byId("frameLabel").textContent =
+      `Frame ${frame + 1} / ${total} · Prev/Next changes frame · arrows move box · Shift = 10 px`;
+  } else {
+    byId("frameLabel").textContent =
+      `${clipFps().toFixed(2)} fps · use Prev / Next or arrow keys`;
+  }
 }
 
 function reviewFrame(step) {
@@ -111,12 +162,22 @@ function reviewFrame(step) {
   const fps = clipFps();
   const duration = clipDuration();
   if (!(fps > 0) || !(duration > 0)) return;
+
+  video.pause();
+
+  if (state.trackComplete && state.track?.times?.length) {
+    const current = getFrameEditIndex();
+    const nextIndex = Math.max(0, Math.min(state.track.times.length - 1, current + step));
+    seekToEditFrame(nextIndex);
+    return;
+  }
+
   const currentFrame = Math.round((Number(video.currentTime) || 0) * fps);
   const lastFrame = Math.max(0, Math.round(duration * fps) - 1);
   const nextFrame = Math.max(0, Math.min(lastFrame, currentFrame + step));
-  video.pause();
   video.currentTime = nextFrame / fps;
   syncPlayButton();
+  syncFrameReview();
 }
 
 function download(name, text, type) {
@@ -257,19 +318,6 @@ function resizeOverlay() {
   drawOverlay();
 }
 
-/** Tracking and display both use the video's native pixel coordinates. */
-function trackToNative(x, y) {
-  return { x, y };
-}
-
-function boxToNative(box) {
-  return box;
-}
-
-function nativeToTrackBox(box) {
-  return box;
-}
-
 function displayedTime() {
   if (Number.isFinite(state.mediaTime)) return state.mediaTime;
   return Number(video.currentTime) || 0;
@@ -292,11 +340,26 @@ function startFrameClock() {
 
 function currentIndex() {
   if (!state.track || !state.track.times.length) return -1;
+  if (state.frameReview && state.trackComplete
+      && Number.isInteger(state.frameEditIndex) && state.frameEditIndex >= 0) {
+    return Math.min(state.track.times.length - 1, state.frameEditIndex);
+  }
   const n = state.track.times.length;
   const start = Number(state.track.start_frame) || 0;
   const fps = Number(state.track.fps) || clipFps();
   const frame = Math.round(displayedTime() * fps);
-  return Math.max(0, Math.min(n - 1, frame - start));
+  const relativeFrame = frame - start;
+  const frameIndices = state.track.frame_indices;
+  if (!frameIndices?.length) return Math.max(0, Math.min(n - 1, relativeFrame));
+
+  let low = 0;
+  let high = frameIndices.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (frameIndices[middle] <= relativeFrame) low = middle + 1;
+    else high = middle;
+  }
+  return Math.max(0, Math.min(n - 1, low - 1));
 }
 
 function trackSampleVideoTime(startFrame, sampleCount) {
@@ -335,21 +398,86 @@ function currentBox() {
   return state.track.bboxes[idx];
 }
 
+/**
+ * Apply a manual correction to the current tracked frame.
+ * x/y and the bbox center are kept synchronized so exports use the correction.
+ */
+function setCurrentTrackPosition(cx, cy) {
+  if (!state.track?.times?.length || state.isTracking) return false;
+
+  const idx = state.frameReview && state.trackComplete
+    ? getFrameEditIndex()
+    : currentIndex();
+  if (idx < 0 || idx >= state.track.times.length) return false;
+
+  const oldBox = state.track.bboxes[idx] || [0, 0, 10, 10];
+  const bw = Math.max(1, Number(oldBox[2]) || 1);
+  const bh = Math.max(1, Number(oldBox[3]) || 1);
+  const width = Number(state.track.width) || video.videoWidth || 1;
+  const height = Number(state.track.height) || video.videoHeight || 1;
+
+  const nextCx = Math.max(
+    bw / 2,
+    Math.min(width - bw / 2, Number(cx) || 0)
+  );
+  const nextCy = Math.max(
+    bh / 2,
+    Math.min(height - bh / 2, Number(cy) || 0)
+  );
+
+  state.track.x[idx] = nextCx;
+  state.track.y[idx] = nextCy;
+  state.track.bboxes[idx] = [
+    nextCx - bw / 2,
+    nextCy - bh / 2,
+    bw,
+    bh,
+  ];
+
+  // The previous spline no longer represents the edited samples.
+  state.scaledSeries = null;
+  clearFitResult();
+  drawOverlay();
+  drawPlot();
+  scheduleSplineFit();
+  syncFrameReview();
+  return true;
+}
+
+function moveCurrentTrackPosition(dx, dy) {
+  const idx = currentIndex();
+  if (idx < 0 || !state.track) return false;
+
+  const box = state.track.bboxes[idx];
+  if (!box) return false;
+
+  return setCurrentTrackPosition(
+    Number(state.track.x[idx]) + dx,
+    Number(state.track.y[idx]) + dy
+  );
+}
+
+function isPointInsideBox(point, box) {
+  return !!point && !!box
+    && point.x >= box[0]
+    && point.x <= box[0] + box[2]
+    && point.y >= box[1]
+    && point.y <= box[1] + box[3];
+}
+
 function toScreen(vx, vy, layout) {
-  const native = state.track ? trackToNative(vx, vy) : { x: vx, y: vy };
   return {
-    x: layout.ox + native.x * layout.scale,
-    y: layout.oy + native.y * layout.scale,
+    x: layout.ox + vx * layout.scale,
+    y: layout.oy + vy * layout.scale,
   };
 }
 
 function drawBoxAt(box, layout, color = "#e02020") {
   if (!box) return;
-  const native = (!state.isDrawingBox && (state.isTracking || state.track)) ? boxToNative(box) : box;
-  const x = layout.ox + native[0] * layout.scale;
-  const y = layout.oy + native[1] * layout.scale;
-  const bw = native[2] * layout.scale;
-  const bh = native[3] * layout.scale;
+  const x = layout.ox + box[0] * layout.scale;
+  const y = layout.oy + box[1] * layout.scale;
+  const bw = box[2] * layout.scale;
+  const bh = box[3] * layout.scale;
   ctx.strokeStyle = color;
   ctx.lineWidth = 3;
   ctx.strokeRect(x, y, bw, bh);
@@ -370,10 +498,9 @@ function drawMask(layout, box) {
   ctx.fillStyle = "rgba(128, 128, 128, 0.84)";
   ctx.fillRect(0, 0, w, h);
   if (!box) return;
-  const native = (!state.isDrawingBox && (state.isTracking || state.track)) ? boxToNative(box) : box;
-  const x = layout.ox + native[0] * layout.scale;
-  const y = layout.oy + native[1] * layout.scale;
-  ctx.clearRect(x, y, native[2] * layout.scale, native[3] * layout.scale);
+  const x = layout.ox + box[0] * layout.scale;
+  const y = layout.oy + box[1] * layout.scale;
+  ctx.clearRect(x, y, box[2] * layout.scale, box[3] * layout.scale);
 }
 
 function drawPolylineScreen(points, color = "#e07070") {
@@ -664,19 +791,10 @@ function setClipMeta(text) {
   byId("clipMeta").textContent = text;
 }
 
-function attachLocalFile(file, extras = {}) {
-  if (!confirmReplaceCurrentClip()) return;
-  const loadId = state.videoLoadId + 1;
-  state.videoLoadId = loadId;
-  state.trackingRunId += 1;
-  state.isTracking = false;
-  state.trackComplete = false;
-  if (state.pendingVideoMetadataHandler) {
-    video.removeEventListener("loadedmetadata", state.pendingVideoMetadataHandler);
-    state.pendingVideoMetadataHandler = null;
-  }
-  clearTimeout(splineFitTimer);
-  state.videoMeta = null;
+/**
+ * Clears all tracking/curve/UI state associated with the previously loaded clip. 
+ */
+function resetTrackingState() {
   state.track = null;
   state.scaledSeries = null;
   state.hasLoadedCurve = false;
@@ -686,9 +804,29 @@ function attachLocalFile(file, extras = {}) {
   state.bbox = null;
   state.isDrawingBox = false;
   state.drawStartPoint = null;
+  state.isTracking = false;
+  state.trackComplete = false;
   state.trackSeekPending = false;
   state.frameReview = false;
+  state.frameEditDrag = null;
+  state.frameEditIndex = -1;
   clearFitResult();
+}
+
+function attachLocalFile(file, extras = {}) {
+  if (!confirmReplaceCurrentClip()) return;
+  const loadId = state.videoLoadId + 1;
+  state.videoLoadId = loadId;
+  state.trackingRunId += 1;
+  // Tracking/curve/UI state for the previous clip is cleared once metadata
+  // resolves and attachVideo() runs (via resetTrackingState()), not here —
+  // nothing below this point reads state.track/bbox/etc. before then.
+  if (state.pendingVideoMetadataHandler) {
+    video.removeEventListener("loadedmetadata", state.pendingVideoMetadataHandler);
+    state.pendingVideoMetadataHandler = null;
+  }
+  clearTimeout(splineFitTimer);
+  state.videoMeta = null;
   setBoxDrawing(false);
   byId("trackBtn").textContent = "Track";
   byId("progressWrap").classList.add("hidden");
@@ -763,18 +901,8 @@ function attachVideo(meta, srcUrl) {
   stopCamera();
   clearLivePreview();
   state.videoMeta = meta;
-  state.track = null;
-  state.scaledSeries = null;
-  state.hasLoadedCurve = false;
-  state.loadedCurveSource = null;
-  state.hasResmoothedLoadedCurve = false;
-  state.exportFileName = null;
-  state.bbox = null;
-  state.isTracking = false;
-  state.trackComplete = false;
-  state.frameReview = false;
+  resetTrackingState();
   setBoxDrawing(false);
-  clearFitResult();
   byId("progressWrap").classList.add("hidden");
   byId("fitHint").textContent = "Track or load JSON. Black dots are knots.";
   byId("invert").checked = true;
@@ -844,14 +972,7 @@ async function showLivePreview(stream) {
   state.trackingRunId += 1;
   state.videoMeta = null;
   state.isLiveCamera = true;
-  state.track = null;
-  state.bbox = null;
-  state.scaledSeries = null;
-  state.hasLoadedCurve = false;
-  state.loadedCurveSource = null;
-  state.hasResmoothedLoadedCurve = false;
-  state.isTracking = false;
-  clearFitResult();
+  resetTrackingState();
   videoFrame.classList.add("live");
   emptyState.classList.add("hidden");
   video.removeAttribute("src");
@@ -891,7 +1012,10 @@ function applyTrackPreview(preview) {
   if (!preview || !state.track || preview.t == null || !preview.bbox) return;
   const times = state.track.times;
   const last = times.length - 1;
-  if (last >= 0 && times[last] === preview.t) {
+  const frameIndex = Number.isInteger(preview.frame_index)
+    ? preview.frame_index
+    : (state.track.frame_indices?.[last] ?? last + 1);
+  if (last >= 0 && (state.track.frame_indices?.[last] ?? last) === frameIndex) {
     state.track.x[last] = preview.x;
     state.track.y[last] = preview.y;
     state.track.bboxes[last] = preview.bbox;
@@ -900,6 +1024,8 @@ function applyTrackPreview(preview) {
     state.track.x.push(preview.x);
     state.track.y.push(preview.y);
     state.track.bboxes.push(preview.bbox);
+    if (!state.track.frame_indices) state.track.frame_indices = [];
+    state.track.frame_indices.push(frameIndex);
   }
   if (preview.lost != null) state.track.lost = preview.lost;
   if (preview.width) state.track.width = preview.width;
@@ -911,6 +1037,7 @@ function applyTrackPreview(preview) {
 function failTracking(message) {
   state.isTracking = false;
   state.trackComplete = false;
+  byId("progressWrap").classList.remove("indeterminate");
   byId("progressWrap").classList.remove("hidden");
   byId("progressText").textContent = message || "Tracking failed";
   drawOverlay();
@@ -919,11 +1046,13 @@ function failTracking(message) {
 function finishTracking(result) {
   state.isTracking = false;
   state.trackComplete = true;
+  byId("progressWrap").classList.remove("indeterminate");
   state.track = result;
   clearFitResult();
   byId("progressWrap").classList.remove("hidden");
   const extra = result.stopped_early ? " (lost the marker)" : "";
   byId("progressText").textContent = `Tracked ${result.times.length} frames, lost ${result.lost}${extra}`;
+  syncFrameReview();
   const seeking = seekToTrackSample(state.track.start_frame, state.track.times.length);
   syncSeekBar();
   if (!seeking) drawOverlay();
@@ -993,6 +1122,20 @@ async function runSplineFit() {
 // Event wiring
 // ---------------------------------------------------------------------------
 
+byId("trackingTipsBtn").addEventListener("click", () => {
+  byId("trackingTipsDialog").showModal();
+});
+
+byId("closeTrackingTipsBtn").addEventListener("click", () => {
+  byId("trackingTipsDialog").close();
+});
+
+byId("trackingTipsDialog").addEventListener("click", (event) => {
+  if (event.target === byId("trackingTipsDialog")) {
+    byId("trackingTipsDialog").close();
+  }
+});
+
 overlay.addEventListener("pointerdown", (event) => {
   if (!state.isDrawingBox || !video.videoWidth) return;
   if (typeof overlay.setPointerCapture === "function") {
@@ -1004,7 +1147,45 @@ overlay.addEventListener("pointerdown", (event) => {
   drawOverlay();
 });
 
+overlay.addEventListener("pointerdown", (event) => {
+  if (state.isDrawingBox || !state.frameReview || !state.trackComplete || state.isTracking) return;
+
+  const idx = getFrameEditIndex();
+  const box = idx >= 0 ? state.track?.bboxes?.[idx] : null;
+  if (!box) return;
+
+  const point = clientToVideo(event);
+  event.preventDefault();
+  if (typeof overlay.setPointerCapture === "function") {
+    overlay.setPointerCapture(event.pointerId);
+  }
+
+  // A click anywhere places the tracker centre there; dragging continues from that point.
+  setCurrentTrackPosition(point.x, point.y);
+  state.frameEditDrag = {
+    pointerId: event.pointerId,
+    startPoint: point,
+    startCx: point.x,
+    startCy: point.y,
+  };
+  overlay.style.cursor = "grabbing";
+});
+
 overlay.addEventListener("pointermove", (event) => {
+  if (state.frameEditDrag) {
+    if (state.frameEditDrag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+
+    const point = clientToVideo(event);
+    const drag = state.frameEditDrag;
+
+    setCurrentTrackPosition(
+      drag.startCx + (point.x - drag.startPoint.x),
+      drag.startCy + (point.y - drag.startPoint.y)
+    );
+    return;
+  }
+
   if (!state.isDrawingBox || !state.drawStartPoint) return;
   const p = clientToVideo(event);
   const x = Math.min(state.drawStartPoint.x, p.x);
@@ -1019,6 +1200,14 @@ overlay.addEventListener("pointermove", (event) => {
 });
 
 function endBoxDrawing() {
+  if (state.frameEditDrag) {
+    state.frameEditDrag = null;
+    overlay.style.cursor =
+      state.frameReview && state.trackComplete ? "grab" : "";
+    drawOverlay();
+    return;
+  }
+
   if (!state.isDrawingBox) return;
   state.drawStartPoint = null;
   setBoxDrawing(false);
@@ -1039,8 +1228,13 @@ byId("drawBtn").addEventListener("click", () => {
   }
   state.isTracking = false;
   state.track = null;
+  state.trackComplete = false;
+  state.frameReview = false;
+  state.frameEditIndex = -1;
+  state.frameEditDrag = null;
   state.scaledSeries = null;
   clearFitResult();
+  syncFrameReview();
   video.pause();
   syncPlayButton();
   setBoxDrawing(true);
@@ -1067,10 +1261,22 @@ byId("playBtn").addEventListener("click", () => {
 
 byId("reviewBtn").addEventListener("click", () => {
   if (!hasClip() || state.isLiveCamera) return;
+
   state.frameReview = !state.frameReview;
-  if (state.frameReview) video.pause();
+  state.frameEditDrag = null;
+
+  if (state.frameReview) {
+    video.pause();
+    if (state.trackComplete && state.track?.times?.length) {
+      state.frameEditIndex = Math.max(0, currentIndex());
+    }
+  } else {
+    state.frameEditIndex = -1;
+  }
+
   syncPlayButton();
   syncFrameReview();
+  drawOverlay();
 });
 
 byId("previousFrameBtn").addEventListener("click", () => reviewFrame(-1));
@@ -1148,17 +1354,21 @@ byId("trackBtn").addEventListener("click", async () => {
   const fps = clipFps();
   let startTime = displayedTime();
   if (duration > 0) startTime = Math.min(startTime, Math.max(0, duration - 1 / fps));
-  const trackBox = nativeToTrackBox(box);
+  const trackBox = box;
   const tw = Number(state.videoMeta?.track_width) || video.videoWidth;
   const th = Number(state.videoMeta?.track_height) || video.videoHeight;
   const runId = state.trackingRunId + 1;
   state.trackingRunId = runId;
   state.isTracking = true;
   state.trackComplete = false;
+  state.frameReview = false;
+  state.frameEditIndex = -1;
   state.trackSeekPending = false;
+  state.frameEditDrag = null;
   state.scaledSeries = null;
   state.track = {
     times: [0],
+    frame_indices: [0],
     x: [trackBox[0] + trackBox[2] / 2],
     y: [trackBox[1] + trackBox[3] / 2],
     bboxes: [trackBox.slice()],
@@ -1187,10 +1397,13 @@ byId("trackBtn").addEventListener("click", async () => {
       shouldStop: () => !state.isTracking || runId !== state.trackingRunId,
       onProgress: (preview, done, total) => {
         if (runId !== state.trackingRunId || !state.isTracking) return;
-        const pct = Math.round((total ? done / total : 0) * 100);
-        byId("progressBar").style.width = `${pct}%`;
+        const pct = total > 0 ? Math.min(100, Math.round(done / total * 100)) : null;
+        byId("progressWrap").classList.toggle("indeterminate", pct == null);
+        if (pct != null) byId("progressBar").style.width = `${pct}%`;
         const lost = preview.lost ? ` · lost ${preview.lost}` : "";
-        byId("progressText").textContent = `Tracking ${pct}%${lost}`;
+        byId("progressText").textContent = pct == null
+          ? `Tracking ${done} frames${lost}`
+          : `Tracking ${pct}%${lost}`;
         applyTrackPreview(preview);
         drawOverlay();
       },
@@ -1406,11 +1619,25 @@ window.addEventListener("resize", () => {
 });
 
 window.addEventListener("keydown", (event) => {
-  if (state.frameReview && !state.isLiveCamera && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+  if (state.frameReview && !state.isLiveCamera && state.trackComplete
+      && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
     event.preventDefault();
-    reviewFrame(event.key === "ArrowLeft" ? -1 : 1);
+
+    const amount = event.shiftKey ? 10 : 5;
+    const dx = event.key === "ArrowLeft" ? -amount : event.key === "ArrowRight" ? amount : 0;
+    const dy = event.key === "ArrowUp" ? -amount : event.key === "ArrowDown" ? amount : 0;
+
+    moveCurrentTrackPosition(dx, dy);
     return;
   }
+
+  if (state.frameReview && !state.isLiveCamera
+      && (event.key === "PageUp" || event.key === "PageDown")) {
+    event.preventDefault();
+    reviewFrame(event.key === "PageUp" ? -1 : 1);
+    return;
+  }
+
   if (event.code === "Space" && event.target === document.body) {
     event.preventDefault();
     byId("playBtn").click();

@@ -150,6 +150,82 @@ h2 {
   padding: 12px 14px 0;
 }
 
+.bundle-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.info-btn {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  padding: 0;
+  border-radius: 50%;
+  font-family: "Syne", sans-serif;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.tips-dialog {
+  width: min(560px, calc(100% - 32px));
+  max-height: min(84vh, 720px);
+  padding: 20px 22px;
+  overflow: auto;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.tips-dialog::backdrop {
+  background: rgba(3, 8, 15, 0.76);
+}
+
+.tips-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.tips-close {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.tips-intro {
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.tips-list {
+  display: grid;
+  gap: 12px;
+  padding-left: 22px;
+  margin: 16px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.tips-list li::marker {
+  color: var(--accent);
+  font-family: "IBM Plex Mono", monospace;
+  font-weight: 500;
+}
+
+.tips-list strong {
+  color: var(--ink);
+  font-weight: 700;
+}
+
 .curve-head { padding-bottom: 8px; }
 .curve-head .hint { text-align: right; }
 
@@ -366,6 +442,16 @@ select {
   inset: 0 auto 0 0;
   width: 0%;
   background: linear-gradient(90deg, #2d6adf, var(--accent));
+}
+
+.progress.indeterminate .bar {
+  width: 30%;
+  animation: progress-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(340%); }
 }
 
 #progressText {

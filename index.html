@@ -38,7 +38,10 @@
     <main class="stage">
       <section class="bundle">
         <div class="bundle-head">
-          <h2>Preview</h2>
+          <div class="bundle-title">
+            <h2>Preview</h2>
+            <button type="button" class="icon-btn info-btn" id="trackingTipsBtn" aria-label="Tracking tips" aria-haspopup="dialog" aria-controls="trackingTipsDialog">i</button>
+          </div>
         </div>  
         <div class="video-frame" id="videoFrame">
           <video id="video" playsinline muted></video>
@@ -108,6 +111,23 @@
       </section>
     </main>
   </div>
+  <dialog class="tips-dialog" id="trackingTipsDialog" aria-labelledby="trackingTipsTitle">
+    <div class="tips-head">
+      <h2 id="trackingTipsTitle">Tracking notes</h2>
+      <button type="button" class="icon-btn tips-close" id="closeTrackingTipsBtn" aria-label="Close tracking notes">×</button>
+    </div>
+    <p class="tips-intro">A few capture choices make a marker much easier to follow:</p>
+    <ol class="tips-list">
+      <li><strong>Make the marker clearly visible.</strong> A tiny marker covers too few pixels to track reliably; keep it large enough to show clear detail.</li>
+      <li><strong>Maximize contrast.</strong> Choose a marker that is much brighter or darker than its nearby background.</li>
+      <li><strong>Prefer browser-friendly video.</strong> H.264 MP4 or WebM often decodes more smoothly. Some iPhone MOV clips use HEVC, high resolutions, or variable frame rates that take longer to process.</li>
+      <li><strong>Use one distinctive marker.</strong> Avoid similar-looking markers near each other so the tracker has a clear target.</li>
+      <li><strong>Record fast motion at a high source frame rate.</strong> Set tracking FPS no higher than the footage's real frame rate; a higher setting cannot restore frames that were not recorded.</li>
+      <li><strong>Keep the marker consistent.</strong> Avoid changes in its size, shape, color, focus, and lighting during a recording.</li>
+      <li><strong>Draw a tight box.</strong> Include the marker with as little surrounding background as possible.</li>
+      <li><strong>Keep it visible.</strong> Avoid occlusion, motion blur, and moving the marker out of frame.</li>
+    </ol>
+  </dialog>
   <script src="spline.js"></script>
   <script src="tracking.js"></script>
   <script src="media.js"></script>

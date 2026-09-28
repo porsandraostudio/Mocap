@@ -382,100 +382,6 @@ const MocapTrack = (() => {
     return gray;
   }
 
-  function rectSum(sat, stride, x0, y0, x1, y1) {
-    return sat[y1 * stride + x1] - sat[y0 * stride + x1] - sat[y1 * stride + x0] + sat[y0 * stride + x0];
-  }
-
-  function detectBrightMarkerBbox(imageData, padFrac = 0.28) {
-    const { data, width, height } = imageData;
-    const sw = width + 1;
-    const sat = new Float64Array(sw * (height + 1));
-    for (let y = 0; y < height; y += 1) {
-      let row = 0;
-      for (let x = 0; x < width; x += 1) {
-        const i = (y * width + x) * 4;
-        row += pixelLum(data[i], data[i + 1], data[i + 2]);
-        sat[(y + 1) * sw + (x + 1)] = sat[y * sw + (x + 1)] + row;
-      }
-    }
-    const meanBox = (cx, cy, r) => {
-      const x0 = Math.max(0, Math.floor(cx - r));
-      const y0 = Math.max(0, Math.floor(cy - r));
-      const x1 = Math.min(width, Math.ceil(cx + r));
-      const y1 = Math.min(height, Math.ceil(cy + r));
-      const area = Math.max(1, (x1 - x0) * (y1 - y0));
-      return rectSum(sat, sw, x0, y0, x1, y1) / area;
-    };
-
-    const rIn = Math.max(5, Math.round(Math.min(width, height) * 0.018));
-    const rOut = Math.max(rIn + 6, Math.round(rIn * 2.5));
-    const margin = Math.ceil(rOut + 2);
-    let best = 0;
-    let bx = Math.floor(width / 2);
-    let by = Math.floor(height / 2);
-    for (let y = margin; y < height - margin; y += 3) {
-      for (let x = margin; x < width - margin; x += 3) {
-        const inner = meanBox(x, y, rIn);
-        const outer = meanBox(x, y, rOut);
-        const innerArea = (2 * rIn) * (2 * rIn);
-        const outerArea = (2 * rOut) * (2 * rOut);
-        const ring = (outer * outerArea - inner * innerArea) / Math.max(1, outerArea - innerArea);
-        const score = Math.abs(inner - ring);
-        if (score > best) {
-          best = score;
-          bx = x;
-          by = y;
-        }
-      }
-    }
-    for (let y = by - 12; y <= by + 12; y += 1) {
-      for (let x = bx - 12; x <= bx + 12; x += 1) {
-        if (x < margin || y < margin || x >= width - margin || y >= height - margin) continue;
-        const inner = meanBox(x, y, rIn);
-        const outer = meanBox(x, y, rOut);
-        const innerArea = (2 * rIn) * (2 * rIn);
-        const outerArea = (2 * rOut) * (2 * rOut);
-        const ring = (outer * outerArea - inner * innerArea) / Math.max(1, outerArea - innerArea);
-        const score = Math.abs(inner - ring);
-        if (score > best) {
-          best = score;
-          bx = x;
-          by = y;
-        }
-      }
-    }
-    if (best < 14) return null;
-
-    const inner = meanBox(bx, by, rIn);
-    const outer = meanBox(bx, by, rOut);
-    const bright = inner > outer;
-    const core = pixelLum(data[(by * width + bx) * 4], data[(by * width + bx) * 4 + 1], data[(by * width + bx) * 4 + 2]);
-    const thresh = bright ? Math.max(outer + 12, core * 0.62) : Math.min(outer - 12, core + (outer - core) * 0.38);
-    let bestR = Math.max(4, rIn);
-    for (let r = 4; r <= 110; r += 2) {
-      let n = 0;
-      let tot = 0;
-      const r2 = r * r;
-      for (let y = Math.max(0, by - r); y <= Math.min(height - 1, by + r); y += 1) {
-        for (let x = Math.max(0, bx - r); x <= Math.min(width - 1, bx + r); x += 1) {
-          const dx = x - bx;
-          const dy = y - by;
-          if (dx * dx + dy * dy > r2) continue;
-          tot += 1;
-          const i = (y * width + x) * 4;
-          const lum = pixelLum(data[i], data[i + 1], data[i + 2]);
-          if (bright ? lum >= thresh : lum <= thresh) n += 1;
-        }
-      }
-      const density = tot ? n / tot : 0;
-      if (r > 8 && density < 0.2) break;
-      bestR = r;
-    }
-    const pad = Math.max(3, bestR * padFrac);
-    const w = Math.max(8, Math.round((bestR + pad) * 2));
-    return clampBbox([bx - w / 2, by - w / 2, w, w], width, height);
-  }
-
   class MosseTracker {
     constructor() {
       this.w = FILTER;
@@ -815,14 +721,16 @@ const MocapTrack = (() => {
     const centerX = [];
     const centerY = [];
     const boxes = [];
+    const frameIndices = [];
     let lostCount = 0;
     let lostStreak = 0;
 
-    const record = (box, timeSec, cx, cy) => {
+    const record = (box, timeSec, cx, cy, frameIndex) => {
       times.push(Number(timeSec));
       centerX.push(cx);
       centerY.push(cy);
       boxes.push(box.map(Number));
+      frameIndices.push(frameIndex);
     };
 
     const preview = () => ({
@@ -830,6 +738,7 @@ const MocapTrack = (() => {
       x: centerX[centerX.length - 1] || 0,
       y: centerY[centerY.length - 1] || 0,
       bbox: boxes[boxes.length - 1] ? boxes[boxes.length - 1].slice() : [0, 0, 0, 0],
+      frame_index: frameIndices[frameIndices.length - 1] || 0,
       n: times.length,
       width: size.width,
       height: size.height,
@@ -839,10 +748,10 @@ const MocapTrack = (() => {
     });
 
     const initBox = tracker._box();
-    record(initBox, 0, tracker.outX, tracker.outY);
+    record(initBox, 0, tracker.outX, tracker.outY, 0);
     const framesTotal = duration > 0 ? Math.max(Math.round(duration * fps) - startFrame, 1) : 0;
     let framesDone = 1;
-    if (onProgress) onProgress(preview(), framesDone, framesTotal || framesDone);
+    if (onProgress) onProgress(preview(), framesDone, framesTotal);
 
     while (!shouldStop()) {
       const nextTime = origin + framesDone / fps;
@@ -864,13 +773,13 @@ const MocapTrack = (() => {
         if (lostStreak >= LOST_LIMIT) break;
       } else {
         lostStreak = 0;
-        record(box, t, cx, cy);
+        record(box, t, cx, cy, Math.max(0, Math.round(t * fps)));
       }
-      if (onProgress) onProgress(preview(), framesDone, framesTotal || framesDone);
+      if (onProgress) onProgress(preview(), framesDone, framesTotal);
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
 
-    if (onProgress) onProgress(preview(), framesDone, framesDone);
+    if (onProgress) onProgress(preview(), framesDone, framesTotal);
 
     return {
       fps,
@@ -878,6 +787,7 @@ const MocapTrack = (() => {
       height: size.height,
       start_frame: startFrame,
       times,
+      frame_indices: frameIndices,
       x: centerX,
       y: centerY,
       bboxes: boxes,
@@ -888,10 +798,6 @@ const MocapTrack = (() => {
 
   const api = {
     trackHtmlVideo,
-    createTracker: () => new MosseTracker(),
-    detectBrightMarkerBbox,
-    clampBbox,
-    LOST_LIMIT,
   };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
